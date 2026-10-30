@@ -103,7 +103,15 @@ FIELDS = [
     ("technique",   "text"),
 ]
 
-# ==================== 4. OUTPUT FILES (you usually won't change these) ====================
+# ==================== 4. PDF ARCHIVING (Extract step) ====================
+
+# Save each processed paper's PDF to output/pdfs/ while extracting. The article
+# PDF is tried first; if none is available, a preprint PDF is used instead.
+# Set to False to skip PDF downloads entirely (extraction still works).
+PDF_ARCHIVE_ENABLED = True
+PDF_DIR = OUTPUT_DIR / "pdfs"
+
+# ==================== 5. OUTPUT FILES (you usually won't change these) ====================
 
 SEARCH_RESULTS_XLSX = OUTPUT_DIR / "search_results.xlsx"
 CLOSED_SOURCE_XLSX  = OUTPUT_DIR / "closed_source_papers.xlsx"

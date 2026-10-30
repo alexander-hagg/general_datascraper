@@ -27,9 +27,19 @@ import config
 import extractor
 import fetcher
 import searchers
+import suggester
 import writer
 from checkpoint import Checkpoint
-from main import CLOSED_COLS, SEARCH_COLS, _load_search_results
+from main import (
+    CLOSED_COLS,
+    NO_PDF_REASON,
+    PDF_MANUAL_REASON,
+    PDF_NO_TEXT_REASON,
+    SEARCH_COLS,
+    _closed_row,
+    _load_search_results,
+    _prepare_paper,
+)
 
 app = Flask(__name__)
 
@@ -204,7 +214,7 @@ def _run_extract_job(job, goal, columns):
         fields = [(c, "text") for c in columns] if columns else list(config.FIELDS)
         field_names = [f[0] for f in fields]
         instruction = make_instruction(goal)
-        extract_cols = ["doi", "source"] + field_names
+        extract_cols = ["doi", "source", "pdf_file", "pdf_source"] + field_names
 
         papers = _load_search_results(required=False)
         if not papers:
@@ -237,22 +247,21 @@ def _run_extract_job(job, goal, columns):
             job["log"].append(f"[{i + 1}/{len(todo)}] {title}")
 
             try:
-                text, source = fetcher.fetch_full_text(p)
+                text, source, pdf = _prepare_paper(p)
             except Exception as e:
                 cp.mark(k, "error", error=str(e))
                 job["log"].append(f"   !! fetch error: {e}")
                 continue
+
+            pdf_file = pdf.get("filename") or ""
+            pdf_source = pdf.get("label") or "none"
+
             if not text:
-                writer.append_xlsx(config.CLOSED_SOURCE_XLSX, CLOSED_COLS, [{
-                    "title": p.get("title", ""),
-                    "authors": p.get("authors", ""),
-                    "doi": p.get("doi", ""),
-                    "source": ", ".join(p.get("sources", [])),
-                    "reason": source,
-                }])
-                cp.mark(k, "closed", reason=source)
+                reason = PDF_NO_TEXT_REASON if pdf.get("path") else (pdf.get("reason") or NO_PDF_REASON)
+                writer.append_xlsx(config.CLOSED_SOURCE_XLSX, CLOSED_COLS, [_closed_row(p, reason)])
+                cp.mark(k, "closed", reason=reason, pdf_file=pdf_file, pdf_source=pdf_source)
                 n_closed += 1
-                job["log"].append(f"   -> closed source ({source})")
+                job["log"].append(f"   -> closed source ({reason})")
                 continue
 
             try:
@@ -264,7 +273,12 @@ def _run_extract_job(job, goal, columns):
 
             rows = [r for r in rows if isinstance(r, dict)]
             out_rows = [
-                {"doi": p.get("doi", ""), "source": ", ".join(p.get("sources", []))}
+                {
+                    "doi": p.get("doi", ""),
+                    "source": ", ".join(p.get("sources", [])),
+                    "pdf_file": pdf_file,
+                    "pdf_source": pdf_source,
+                }
                 | {f: r.get(f, "") for f in field_names}
                 for r in rows
             ]
@@ -281,7 +295,16 @@ def _run_extract_job(job, goal, columns):
                 else:
                     writer.append_xlsx(config.EXTRACTED_XLSX, extract_cols, out_rows)
                 n_extracted += len(out_rows)
-            cp.mark(k, "extracted", n=len(out_rows))
+
+            # Rule 3: text was extractable but no PDF/preprint could be archived.
+            # Only when archiving is enabled — a user who disabled downloads should
+            # not be nagged about a manual PDF gap.
+            if not pdf.get("path") and getattr(config, "PDF_ARCHIVE_ENABLED", True):
+                writer.append_xlsx(config.CLOSED_SOURCE_XLSX, CLOSED_COLS, [_closed_row(p, PDF_MANUAL_REASON)])
+                n_closed += 1
+                job["log"].append(f"   -> {PDF_MANUAL_REASON}")
+
+            cp.mark(k, "extracted", n=len(out_rows), pdf_file=pdf_file, pdf_source=pdf_source)
             job["log"].append(f"   -> {len(out_rows)} row(s)")
 
         job["progress"]["done"] = len(todo)

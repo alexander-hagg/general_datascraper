@@ -24,6 +24,7 @@ from openpyxl import load_workbook
 import config
 import extractor
 import fetcher
+import pdf_fetcher
 import searchers
 import writer
 from checkpoint import Checkpoint
@@ -33,7 +34,12 @@ SEARCH_COLS = [
     "year", "journal", "is_open_access", "fulltext_url",
 ]
 CLOSED_COLS = ["title", "authors", "doi", "source", "reason"]
-EXTRACT_COLS = ["doi", "source"] + [e[0] for e in config.FIELDS]
+EXTRACT_COLS = ["doi", "source", "pdf_file", "pdf_source"] + [e[0] for e in config.FIELDS]
+
+# Closed-source reasons introduced by PDF archiving.
+NO_PDF_REASON = "no PDF and no preprint found"
+PDF_MANUAL_REASON = "PDF unavailable — download manually"
+PDF_NO_TEXT_REASON = "PDF saved but no extractable text"
 
 
 def run_search():
@@ -95,6 +101,32 @@ def _load_search_results(required=True):
     return papers
 
 
+def _prepare_paper(p):
+    """Fetch full text and archive the PDF for one paper.
+
+    Returns (text, text_source, pdf). If full-text fetching failed but a PDF was
+    saved, the PDF's own text is used so extraction can still proceed.
+    """
+    text, source = fetcher.fetch_full_text(p)
+    pdf = pdf_fetcher.acquire_pdf(p)
+    if not text and pdf.get("path"):
+        pdf_text = pdf_fetcher.pdf_text(pdf["path"])
+        if pdf_text and len(pdf_text.strip()) >= fetcher.MIN_TEXT_CHARS:
+            text = pdf_text
+            source = f"pdf:{pdf.get('server') or 'unknown'}"
+    return text, source, pdf
+
+
+def _closed_row(p, reason):
+    return {
+        "title": p.get("title", ""),
+        "authors": p.get("authors", ""),
+        "doi": p.get("doi", ""),
+        "source": ", ".join(p.get("sources", [])),
+        "reason": reason,
+    }
+
+
 def run_extract(limit=None, papers=None):
     print("== Step 2/2: fetching + extracting ==")
     extractor.check_backend()
@@ -123,22 +155,20 @@ def run_extract(limit=None, papers=None):
         print(f"\n[{k}] {title}")
 
         try:
-            text, source = fetcher.fetch_full_text(p)
+            text, source, pdf = _prepare_paper(p)
         except Exception as e:
             cp.mark(k, "error", error=str(e))
             print(f"  !! fetch error: {e}")
             continue
 
+        pdf_file = pdf.get("filename") or ""
+        pdf_source = pdf.get("label") or "none"
+
         if not text:
-            writer.append_xlsx(config.CLOSED_SOURCE_XLSX, CLOSED_COLS, [{
-                "title": p.get("title", ""),
-                "authors": p.get("authors", ""),
-                "doi": p.get("doi", ""),
-                "source": ", ".join(p.get("sources", [])),
-                "reason": source,
-            }])
-            cp.mark(k, "closed", reason=source)
-            print(f"  -> closed source: {source}")
+            reason = PDF_NO_TEXT_REASON if pdf.get("path") else (pdf.get("reason") or NO_PDF_REASON)
+            writer.append_xlsx(config.CLOSED_SOURCE_XLSX, CLOSED_COLS, [_closed_row(p, reason)])
+            cp.mark(k, "closed", reason=reason, pdf_file=pdf_file, pdf_source=pdf_source)
+            print(f"  -> closed source: {reason}")
             continue
 
         print(f"  -> got full text ({len(text)} chars) via {source}; extracting ...")
@@ -152,12 +182,26 @@ def run_extract(limit=None, papers=None):
         rows = [r for r in rows if isinstance(r, dict)]
         field_names = [e[0] for e in config.FIELDS]
         out_rows = [
-            {"doi": p.get("doi", ""), "source": ", ".join(p.get("sources", []))}
+            {
+                "doi": p.get("doi", ""),
+                "source": ", ".join(p.get("sources", [])),
+                "pdf_file": pdf_file,
+                "pdf_source": pdf_source,
+            }
             | {f: r.get(f, "") for f in field_names}
             for r in rows
         ]
         writer.append_xlsx(config.EXTRACTED_XLSX, EXTRACT_COLS, out_rows)
-        cp.mark(k, "extracted", n=len(out_rows))
+
+        # Rule 3: text was extractable but no PDF/preprint could be archived.
+        # Keep the extracted data, but also flag the PDF gap for the user.
+        # Only when archiving is enabled — a user who disabled downloads should
+        # not be nagged about a manual PDF gap.
+        if not pdf.get("path") and getattr(config, "PDF_ARCHIVE_ENABLED", True):
+            writer.append_xlsx(config.CLOSED_SOURCE_XLSX, CLOSED_COLS, [_closed_row(p, PDF_MANUAL_REASON)])
+            print(f"  -> {PDF_MANUAL_REASON}")
+
+        cp.mark(k, "extracted", n=len(out_rows), pdf_file=pdf_file, pdf_source=pdf_source)
         print(f"  -> wrote {len(out_rows)} row(s)")
 
     print(f"\nDone. See {config.EXTRACTED_XLSX} and {config.CLOSED_SOURCE_XLSX}.")
