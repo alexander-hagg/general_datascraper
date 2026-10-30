@@ -319,6 +319,61 @@ def api_sources():
     ])
 
 
+@app.route("/api/autocomplete")
+def api_autocomplete():
+    """Proxy PubMed's autocomplete endpoint (avoids browser CORS issues).
+
+    Always answers 200 with a list (possibly empty) so a failed upstream lookup
+    degrades silently to "no suggestions". `source` lets the UI badge every
+    completion as coming from PubMed.
+    """
+    query = (request.args.get("q") or "").strip()
+    try:
+        limit = int(request.args.get("limit") or suggester.MAX_AUTOCOMPLETE)
+    except (TypeError, ValueError):
+        limit = suggester.MAX_AUTOCOMPLETE
+    return jsonify({
+        "query": query,
+        "source": "pubmed",
+        "suggestions": suggester.autocomplete(query, limit),
+    })
+
+
+@app.route("/api/suggest", methods=["POST"])
+def api_suggest():
+    """LLM-backed related-term expansion.
+
+    Request body:
+      {"term": "ENaC"}             -> {"term": ..., "source": "llm", "model": ...,
+                                       "suggestions": [...]}
+      {"terms": ["ENaC", "..."]}   -> {"source": "llm", "model": ...,
+                                       "groups": [{"term", "source", "model",
+                                                   "suggestions"}, ...]}
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        if isinstance(data.get("terms"), list):
+            meta = suggester.llm_source()
+            groups = [
+                {**group, **meta}
+                for group in suggester.suggest_related_many(data["terms"])
+            ]
+            return jsonify({**meta, "groups": groups})
+        term = (data.get("term") or "").strip()
+        meta = suggester.llm_source()
+        return jsonify({
+            "term": term,
+            **meta,
+            "suggestions": suggester.suggest_related(term),
+        })
+    except suggester.BackendUnavailable as e:
+        return jsonify({"error": str(e)}), 503
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:  # unexpected LLM/parse failure: report, don't crash
+        return jsonify({"error": f"Could not generate suggestions: {e}"}), 502
+
+
 @app.route("/api/settings", methods=["GET", "POST"])
 def api_settings():
     if request.method == "POST":

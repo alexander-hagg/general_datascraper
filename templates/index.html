@@ -26,8 +26,23 @@
       <h2><span class="step">1</span> Search for papers</h2>
 
       <label class="field-label">Search terms</label>
-      <div id="term-list"></div>
-      <button class="ghost-btn" id="add-term" type="button">+ Add another term</button>
+      <p class="hint">Combine rows with AND/OR/NOT and groups with AND/OR. Select rows or groups
+        with the checkboxes, then wrap them into a nested group. Click a group header to cycle
+        its selection (group → members → group). Multi-word terms are quoted automatically.</p>
+      <div id="term-list" class="query-builder"></div>
+      <div class="query-actions">
+        <button class="ghost-btn" id="add-term" type="button">+ Add term</button>
+        <button class="ghost-btn" id="add-group" type="button">+ Add group</button>
+        <button class="ghost-btn" id="wrap-selected" type="button">Wrap selected in group</button>
+        <button class="ghost-btn" id="suggest-all" type="button" title="Expand every term with related terms (LLM)">✨ Suggest related terms</button>
+      </div>
+
+      <div id="global-suggest-panel" class="suggest-panel global-suggest-panel hidden"></div>
+
+      <div class="query-preview-wrap">
+        <span class="field-label">Query preview</span>
+        <code id="query-preview" class="query-preview">(empty query)</code>
+      </div>
 
       <div class="row">
         <div class="col">
