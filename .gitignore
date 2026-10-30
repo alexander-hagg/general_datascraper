@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+output/pdfs/
+output/checkpoint.json
+output/*.xlsx
