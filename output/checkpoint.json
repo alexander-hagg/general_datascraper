@@ -1,1 +1,92 @@
-{}
+{
+  "pmid:24736849": {
+    "status": "closed",
+    "reason": "no PDF and no preprint found",
+    "pdf_file": "",
+    "pdf_source": "none"
+  },
+  "pmid:23449374": {
+    "status": "closed",
+    "reason": "PDF saved but no extractable text",
+    "pdf_file": "PMID_23449374.pdf",
+    "pdf_source": "article:unpaywall"
+  },
+  "pmid:21191280": {
+    "status": "closed",
+    "reason": "no PDF and no preprint found",
+    "pdf_file": "",
+    "pdf_source": "none"
+  },
+  "pmid:25926434": {
+    "status": "closed",
+    "reason": "no PDF and no preprint found",
+    "pdf_file": "",
+    "pdf_source": "none"
+  },
+  "pmid:36752468": {
+    "status": "closed",
+    "reason": "no PDF and no preprint found",
+    "pdf_file": "",
+    "pdf_source": "none"
+  },
+  "pmid:42077744": {
+    "status": "extracted",
+    "n": 0,
+    "pdf_file": "PMID_42077744.pdf",
+    "pdf_source": "article:unpaywall"
+  },
+  "pmid:42412512": {
+    "status": "extracted",
+    "n": 0,
+    "pdf_file": "",
+    "pdf_source": "none"
+  },
+  "pmid:40696293": {
+    "status": "extracted",
+    "n": 1,
+    "pdf_file": "PMID_40696293.pdf",
+    "pdf_source": "article:unpaywall"
+  },
+  "pmid:42717213": {
+    "status": "extracted",
+    "n": 0,
+    "pdf_file": "",
+    "pdf_source": "none"
+  },
+  "pmid:41535006": {
+    "status": "extracted",
+    "n": 0,
+    "pdf_file": "PMID_41535006.pdf",
+    "pdf_source": "article:unpaywall"
+  },
+  "doi:10.4137/bci.s880": {
+    "status": "closed",
+    "reason": "no PDF and no preprint found",
+    "pdf_file": "",
+    "pdf_source": "none"
+  },
+  "doi:10.1007/s00424-003-1056-5": {
+    "status": "extracted",
+    "n": 0,
+    "pdf_file": "10.1007_s00424-003-1056-5.pdf",
+    "pdf_source": "article:source"
+  },
+  "doi:10.1074/jbc.m109.018945": {
+    "status": "closed",
+    "reason": "no PDF and no preprint found",
+    "pdf_file": "",
+    "pdf_source": "none"
+  },
+  "doi:10.2218/gtopdb/f122/2023.1": {
+    "status": "extracted",
+    "n": 0,
+    "pdf_file": "10.2218_gtopdb_f122_2023.1.pdf",
+    "pdf_source": "article:unpaywall"
+  },
+  "doi:10.2218/gtopdb/f122/2021.2": {
+    "status": "extracted",
+    "n": 0,
+    "pdf_file": "10.2218_gtopdb_f122_2021.2.pdf",
+    "pdf_source": "article:unpaywall"
+  }
+}
