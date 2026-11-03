@@ -1421,7 +1421,9 @@ function renderProgress(job) {
 /* ---------- results: tabs, grouping, selection ---------- */
 
 let activeResultsTab = "search";
-let selectedData = { groupKey: "", rowId: "", paper: null, row: null };
+let selectedData = {
+  groupKey: "", rowId: "", paper: null, row: null, annotation: null,
+};
 
 function cleanValue(value) {
   return value === null || value === undefined ? "" : String(value).trim();
@@ -1567,7 +1569,11 @@ async function loadResults() {
     : "";
 
   if (hasExtracted) {
-    renderDataGroups(extracted, buildSearchIndex(data.search));
+    renderDataGroups(
+      extracted,
+      buildSearchIndex(data.search),
+      data.annotations || {},
+    );
   } else {
     document.getElementById("extracted-count").textContent = "";
     document.getElementById("paper-group-count").textContent = "";
@@ -1631,10 +1637,11 @@ function renderTable(containerId, header, rows, options) {
   }
 }
 
-function groupExtractedRows(extracted, searchIndex) {
+function groupExtractedRows(extracted, searchIndex, annotations) {
   const header = extracted.header || [];
   const groups = new Map();
   const unlinkedKey = "__unlinked__";
+  const annotationMap = annotations || {};
 
   (extracted.rows || []).forEach((values, rawIndex) => {
     const obj = rowObject(header, values);
@@ -1648,6 +1655,7 @@ function groupExtractedRows(extracted, searchIndex) {
         key: groupKey,
         unlinked: groupKey === unlinkedKey,
         paper: match ? match.obj : null,
+        annotation: annotationMap[groupKey] || annotationMap[keys[0]] || null,
         rows: [],
       });
     }
@@ -1668,8 +1676,8 @@ function groupTitle(group) {
   return "Paper not found in the current search results";
 }
 
-function renderDataGroups(extracted, searchIndex) {
-  const groups = groupExtractedRows(extracted, searchIndex);
+function renderDataGroups(extracted, searchIndex, annotations) {
+  const groups = groupExtractedRows(extracted, searchIndex, annotations);
   const container = document.getElementById("data-groups");
   container.innerHTML = "";
 
@@ -1747,6 +1755,7 @@ function renderDataGroups(extracted, searchIndex) {
       if (selectedData.rowId === rowId) {
         tr.classList.add("selected");
         selectedStillVisible = true;
+        selectedData.annotation = group.annotation || selectedData.annotation;
       }
 
       header.forEach(name => {
@@ -1781,6 +1790,49 @@ function renderDataGroups(extracted, searchIndex) {
   else if (selectedData.rowId) renderSelectionDetails();
 }
 
+function evidenceMetadataForRow(annotation, row) {
+  if (!annotation || !Array.isArray(annotation.evidence) || !row) return null;
+  const rowIndex = cleanValue(row.row_index);
+  if (rowIndex) {
+    const byIndex = annotation.evidence.find(
+      item => item && cleanValue(item.row_index) === rowIndex
+    );
+    if (byIndex) return byIndex;
+  }
+  const quote = cleanValue(row.evidence);
+  if (quote) {
+    return annotation.evidence.find(
+      item => item && cleanValue(item.text) === quote
+    ) || null;
+  }
+  return null;
+}
+
+function evidenceStatusLabel(status) {
+  if (status === "exact") return "exact match";
+  if (status === "fuzzy") return "fuzzy match";
+  if (status === "unresolved") return "not located in the PDF";
+  return "";
+}
+
+function resetPdfViewer() {
+  const viewer = document.getElementById("pdf-viewer");
+  const link = document.getElementById("pdf-new-tab");
+  const unavailable = document.getElementById("pdf-unavailable");
+  if (viewer) {
+    viewer.classList.add("hidden");
+    viewer.removeAttribute("src");
+    delete viewer.dataset.currentUrl;
+    viewer.src = "about:blank";
+  }
+  if (link) {
+    link.classList.add("hidden");
+    link.hidden = true;
+    link.removeAttribute("href");
+  }
+  if (unavailable) unavailable.classList.add("hidden");
+}
+
 function selectDataRow(group, rowState, tr) {
   document.querySelectorAll(".data-row.selected").forEach(el => el.classList.remove("selected"));
   tr.classList.add("selected");
@@ -1791,35 +1843,50 @@ function selectDataRow(group, rowState, tr) {
     row: rowState.obj,
     rowNumber: rowState.displayRow,
     groupTitle: groupTitle(group),
+    annotation: group.annotation || null,
   };
   renderSelectionDetails();
 }
 
 function clearSelectedData() {
-  selectedData = { groupKey: "", rowId: "", paper: null, row: null };
+  selectedData = {
+    groupKey: "", rowId: "", paper: null, row: null, annotation: null,
+  };
   document.querySelectorAll(".data-row.selected").forEach(el => el.classList.remove("selected"));
   const placeholder = document.getElementById("pdf-placeholder");
   const details = document.getElementById("selection-details");
+  const summary = document.getElementById("selection-summary");
+  const evidenceText = document.getElementById("evidence-text");
+  const evidenceMeta = document.getElementById("evidence-meta");
   if (placeholder) placeholder.classList.remove("hidden");
-  if (details) {
-    details.classList.add("hidden");
-    details.innerHTML = "";
-  }
+  if (details) details.classList.add("hidden");
+  if (summary) summary.innerHTML = "";
+  if (evidenceText) evidenceText.textContent = "";
+  if (evidenceMeta) evidenceMeta.textContent = "";
+  resetPdfViewer();
 }
 
 function renderSelectionDetails() {
   const placeholder = document.getElementById("pdf-placeholder");
   const details = document.getElementById("selection-details");
+  const summary = document.getElementById("selection-summary");
+  const evidenceTextEl = document.getElementById("evidence-text");
+  const evidenceMetaEl = document.getElementById("evidence-meta");
   if (!placeholder || !details) return;
   if (!selectedData.rowId) { clearSelectedData(); return; }
+  if (!summary || !evidenceTextEl || !evidenceMetaEl) return;
 
   placeholder.classList.add("hidden");
   details.classList.remove("hidden");
-  details.innerHTML = "";
+  summary.innerHTML = "";
 
   const paper = selectedData.paper || {};
-  details.appendChild(makeEl("p", "selection-eyebrow", "Selected paper"));
-  details.appendChild(makeEl(
+  const row = selectedData.row || {};
+  const annotation = selectedData.annotation || null;
+  const evidenceMetaForRow = evidenceMetadataForRow(annotation, row);
+
+  summary.appendChild(makeEl("p", "selection-eyebrow", "Selected paper"));
+  summary.appendChild(makeEl(
     "h3",
     "selection-title",
     selectedData.groupTitle || "Selected paper"
@@ -1830,7 +1897,7 @@ function renderSelectionDetails() {
     cleanValue(paper.year),
     cleanValue(paper.source),
   ].filter(Boolean).join(" · ");
-  if (meta) details.appendChild(makeEl("p", "selection-meta", meta));
+  if (meta) summary.appendChild(makeEl("p", "selection-meta", meta));
 
   const facts = document.createElement("dl");
   facts.className = "selection-facts";
@@ -1845,35 +1912,67 @@ function renderSelectionDetails() {
   };
   addFact("Paper key", selectedData.groupKey === "__unlinked__" ? "unlinked" : selectedData.groupKey);
   addFact("Row", selectedData.rowNumber);
-  addFact("DOI", cleanValue(selectedData.row.doi));
-  details.appendChild(facts);
-
-  const evidence = document.createElement("div");
-  evidence.className = "evidence-placeholder";
-  evidence.appendChild(makeEl("p", "field-label", "Evidence"));
-  const evidenceText = cleanValue(selectedData.row.evidence);
-  const page = cleanValue(selectedData.row.evidence_page);
-  if (evidenceText || page) {
-    if (evidenceText) evidence.appendChild(makeEl("p", "evidence-text", evidenceText));
-    if (page) evidence.appendChild(makeEl("p", "muted", "Page: " + page));
-  } else {
-    evidence.appendChild(makeEl(
-      "p",
-      "muted",
-      "Evidence snippets and page numbers will appear here in a later update."
-    ));
+  addFact("DOI", cleanValue(row.doi));
+  if (annotation && cleanValue(annotation.pdf_source)) {
+    addFact("PDF source", cleanValue(annotation.pdf_source));
   }
-  details.appendChild(evidence);
+  summary.appendChild(facts);
 
-  const pdfNote = document.createElement("div");
-  pdfNote.className = "pdf-slot";
-  pdfNote.appendChild(makeEl("p", "pdf-slot-title", "Source PDF"));
-  pdfNote.appendChild(makeEl(
-    "p",
-    "muted",
-    "PDF viewing and annotation will appear in this space."
-  ));
-  details.appendChild(pdfNote);
+  // The quote panel stays useful even when the browser's PDF viewer ignores
+  // embedded highlights (or when no PDF was archived at all).
+  const quote = cleanValue(row.evidence)
+    || cleanValue(evidenceMetaForRow && evidenceMetaForRow.text);
+  evidenceTextEl.textContent = quote || "No evidence quote was extracted for this row.";
+  evidenceTextEl.classList.toggle("muted", !quote);
+
+  const page = cleanValue(evidenceMetaForRow && evidenceMetaForRow.page)
+    || cleanValue(row.evidence_page);
+  const statusLabel = evidenceStatusLabel(evidenceMetaForRow && evidenceMetaForRow.status);
+  const detailsBits = [];
+  if (page) detailsBits.push("Page " + page);
+  if (statusLabel) detailsBits.push(statusLabel);
+  if (evidenceMetaForRow) {
+    evidenceMetaEl.dataset.status = cleanValue(evidenceMetaForRow.status);
+  } else {
+    delete evidenceMetaEl.dataset.status;
+  }
+  evidenceMetaEl.textContent = detailsBits.join(" · ");
+
+  const viewer = document.getElementById("pdf-viewer");
+  const link = document.getElementById("pdf-new-tab");
+  const unavailable = document.getElementById("pdf-unavailable");
+  const groupKey = selectedData.groupKey;
+  const hasPdf = !!(
+    annotation
+    && annotation.available
+    && groupKey
+    && groupKey !== "__unlinked__"
+  );
+
+  if (hasPdf && viewer && link && unavailable) {
+    const pageNumber = page || "1";
+    const url = "/api/annotated-pdf/"
+      + encodeURIComponent(groupKey)
+      + "#page=" + encodeURIComponent(pageNumber);
+    if (viewer.dataset.currentUrl !== url) {
+      viewer.dataset.currentUrl = url;
+      viewer.src = url;
+    }
+    viewer.classList.remove("hidden");
+    link.href = url;
+    link.hidden = false;
+    link.classList.remove("hidden");
+    unavailable.classList.add("hidden");
+  } else if (viewer && link && unavailable) {
+    viewer.classList.add("hidden");
+    viewer.removeAttribute("src");
+    delete viewer.dataset.currentUrl;
+    viewer.src = "about:blank";
+    link.classList.add("hidden");
+    link.hidden = true;
+    link.removeAttribute("href");
+    unavailable.classList.remove("hidden");
+  }
 }
 
 function downloadFile(name) {

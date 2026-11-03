@@ -21,7 +21,7 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   When changing setup/start behavior or dry-run output, keep `setup.sh`,
   `setup.ps1`, `start.sh`, and `start.bat` in sync.
 - Tests: `.venv/bin/python -m unittest discover -s tests -v` (mocked, no network).
-  Smoke check: `.venv/bin/python -c "import app, main, searchers"`.
+  Smoke check: `.venv/bin/python -c "import app, main, searchers, pdf_annotations"`.
   `main.py --search-only` and any extraction/suggestions hit live services
   (PubMed/Europe PMC/Crossref, Ollama or the OpenAI-compatible endpoint).
 - Extraction and ✨ suggestions require Ollama running with the configured model
@@ -34,10 +34,13 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
 - `config.py` is the single settings source: queries, sources, `YEAR_FROM` /
   `YEAR_TO`, local-PDF defaults (`LOCAL_PDF_DIR`, `LOCAL_PDF_RECURSIVE`,
   `MAX_LOCAL_PDFS`), LLM backend, `FIELDS` (drives the generated
-  JSON schema/prompt), PDF archiving, prompt-history path/caps, output paths,
-  Flask host/port. The web Settings panel persists email/model/max-results/year
-  range/local folder to `output/web_settings.json`; those values **override
-  `config.py` at app startup**.
+  JSON schema/prompt), PDF archiving, evidence/annotation settings
+  (`EVIDENCE_ENABLED`, `EVIDENCE_MAX_CHARS`, `EVIDENCE_FUZZY_THRESHOLD`,
+  `PDF_INDEX_JSON`, `ANNOTATED_PDF_DIR`), prompt-history path/caps, output
+  paths, Flask host/port. The web Settings panel persists
+  email/model/max-results/year range/local folder to
+  `output/web_settings.json`; those values **override `config.py` at app
+  startup**.
 - `local_pdfs.py`: local folder source. `scan_folder()` validates the folder,
   reads pypdf metadata plus a DOI from the first three pages, dedupes by DOI then
   normalized title, and copies/hardlinks each valid `%PDF-` into `config.PDF_DIR`
@@ -68,16 +71,39 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   first, then preprint (Europe PMC PPR → Crossref relations → bioRxiv/medRxiv).
   Only payloads starting with `%PDF-` are saved; filenames are deterministic
   (PMID > DOI > title).
+- `pdf_annotations.py`: locates the model's verbatim `evidence` quote in the
+  archived PDF (PyMuPDF `search_for`, normalized block matching, then
+  `difflib.SequenceMatcher` fuzzy matching at `EVIDENCE_FUZZY_THRESHOLD`),
+  fills `evidence_page`, writes one cached highlighted PDF per paper to
+  `output/annotated_pdfs/`, and updates `output/pdf_index.json` atomically under
+  a lock. The annotation filename contains a hash of paper key + source bytes +
+  evidence list; a matching file is reused. The index stores basenames only.
+  `annotate_paper_rows()` fills rows and returns `(rows, summary)` and never
+  raises. `load_index()`, `api_summary()`, `resolve_paper_paths()` and
+  `regenerate_annotation()` are the safe read/serve helpers (they reject
+  absolute paths, `..` and escapes outside `PDF_DIR` / `ANNOTATED_PDF_DIR`).
 - `extractor.py`: Ollama path constrains output with the JSON schema and expects a
   bare array; OpenAI JSON mode requires the `{"items": [...]}` object wrapper.
   Both shapes plus fenced/prose fallbacks are handled in `_parse_response`.
-  Ollama extraction timeout is 900 s.
+  The schema/prompt ask for the reserved `evidence` string when
+  `EVIDENCE_ENABLED` is true; `main.make_instruction()` adds the same rule and
+  spells out one quote per table row in table mode. Ollama extraction timeout
+  is 900 s.
 - `app.py`: thin Flask layer that imports `_prepare_paper`, `_load_search_results`,
   etc. from `main.py`, so engine changes affect both interfaces. Jobs are
   in-memory and one-at-a-time; do not enable Flask's reloader or multiple workers.
+  `GET /api/annotated-pdf/<path:paper_key>` serves only keys in
+  `output/pdf_index.json`, regenerating a missing annotation or falling back to
+  the original PDF; unknown/invalid keys are 404. `GET /api/results` keeps
+  `{search, extracted, closed}` and adds the API-safe `annotations` mapping.
+  `/download` exposes only the three Excel files.
 - `static/app.js` + `templates/index.html`: vanilla JS query builder, no bundler.
   `/api/autocomplete` proxies PubMed suggestions to avoid browser CORS;
-  `/api/suggest` uses the LLM through `suggester.py`.
+  `/api/suggest` uses the LLM through `suggester.py`. The Data & PDFs tab keeps
+  the grouped extracted table on the left and a sticky ~46% quote/PDF pane on
+  the right (`iframe#pdf-viewer`, annotations metadata by `row_index`, page
+  anchor, "Open in new tab"); mobile stacks the pane below the table. The quote
+  panel is the fallback because browser PDF viewers vary in highlight support.
 
 ## Behavior that is easy to break
 
@@ -97,6 +123,16 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   closed flow records `PDF saved but no extractable text`. A missing indexed file
   falls back to the normal online path. Local PDFs are not filtered by
   `--year-from`/`--year-to`; the range only affects the online search.
+- **Evidence/annotation is best-effort and must never fail extraction:**
+  both `main.run_extract()` and `app._run_extract_job()` call
+  `pdf_annotations.annotate_paper_rows()` after `build_extract_rows()` and
+  before writing Excel, only when a PDF path exists and `EVIDENCE_ENABLED` is
+  true. Any exception is logged as a warning; the extracted rows (with evidence
+  text and blank `evidence_page`) are still written. No PDF means the quote is
+  kept and the page stays blank. The index registers a PDF even when no quote
+  resolves, so the viewer can show the original. The index/annotations store
+  basenames only; never add an API/serving path that accepts a caller-supplied
+  filename. There is **no OCR**: image-only PDFs leave quotes unresolved.
 - **Web folder-only search:** `/api/search` allows an empty query and no sources
   only when a valid `local_folder` is supplied. Supplying a query without sources
   (or sources without a query) is still a 400. Omitted `local_folder` /
@@ -139,7 +175,9 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
 - Output files: `search_results.xlsx`, `extracted_data.xlsx` (appended),
   `closed_source_papers.xlsx` (appended), `checkpoint.json`,
   `local_pdfs.json` (local mapping, git-ignored), `prompt_history.json`
-  (global web prompt history, git-ignored), `pdfs/`.
+  (global web prompt history, git-ignored), `pdfs/`, `pdf_index.json`
+  (evidence/annotation index, git-ignored), `annotated_pdfs/` (cached
+  highlighted copies, git-ignored).
 
 ## Repository gotchas
 

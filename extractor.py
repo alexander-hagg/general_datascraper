@@ -18,6 +18,44 @@ import requests
 
 import config
 
+# Reserved technical field: never a user-defined column (main.validate_user_columns
+# rejects the name). The value is copied from the model's answer into the
+# extracted_data.xlsx `evidence` column.
+EVIDENCE_FIELD = "evidence"
+
+
+def _evidence_enabled():
+    return bool(getattr(config, "EVIDENCE_ENABLED", True))
+
+
+def _evidence_limit():
+    try:
+        limit = int(getattr(config, "EVIDENCE_MAX_CHARS", 300))
+    except (TypeError, ValueError):
+        limit = 300
+    return max(1, limit)
+
+
+def evidence_instruction(mode=None):
+    """Prompt rule that asks for a short verbatim evidence quote.
+
+    `mode="table"` makes the "one quote per row" expectation explicit. The
+    same wording is used by the extractor prompt and by main.make_instruction,
+    so both interfaces ask the model for the same reserved field.
+    """
+    scope = (
+        "Return one quote per table row (one for every TABLE ROW)."
+        if mode == "table"
+        else "Return one quote for every record you return."
+    )
+    return (
+        f'- Evidence: every returned object must contain an "{EVIDENCE_FIELD}" '
+        f"field with a short VERBATIM quote (at most {_evidence_limit()} "
+        "characters) copied exactly from the TEXT that supports that record. "
+        "Never paraphrase, summarise, translate or invent the quote; if no "
+        f"verbatim quote supports a record, use an empty string. {scope}"
+    )
+
 
 def build_schema(fields):
     properties = {}
@@ -29,12 +67,17 @@ def build_schema(fields):
             properties[name] = {"type": "string", "enum": entry[2]}
         else:  # "text"
             properties[name] = {"type": "string"}
+    required = [e[0] for e in fields]
+    if _evidence_enabled():
+        properties[EVIDENCE_FIELD] = {"type": "string"}
+        if EVIDENCE_FIELD not in required:
+            required.append(EVIDENCE_FIELD)
     return {
         "type": "array",
         "items": {
             "type": "object",
             "properties": properties,
-            "required": [e[0] for e in fields],
+            "required": required,
         },
     }
 
@@ -57,8 +100,11 @@ def _build_prompt(text, instruction, fields):
         instruction.strip()
         + "\n\nFor each entry, return a JSON object with exactly these fields:\n"
         + _field_prompt(fields)
-        + "\n\n"
+        + "\n"
     )
+    if _evidence_enabled():
+        base += evidence_instruction() + "\n"
+    base += "\n"
     if config.LLM_BACKEND == "openai":
         # OpenAI JSON mode requires a top-level OBJECT, so wrap the array.
         base += 'Return ONLY a JSON object with a single key "items" whose value is '
@@ -134,7 +180,15 @@ def extract(text, fields=None, instruction=None):
         raw = _call_openai(prompt)
     else:
         raw = _call_ollama(prompt, fields)
-    return _parse_response(raw)
+    records = _parse_response(raw)
+    if _evidence_enabled():
+        # The reserved field is always a string, even when the model omitted it
+        # or returned null. The value itself is never rewritten (verbatim!).
+        for record in records:
+            if isinstance(record, dict):
+                value = record.get("evidence", "")
+                record["evidence"] = "" if value is None else str(value)
+    return records
 
 
 def _call_ollama(prompt, fields):

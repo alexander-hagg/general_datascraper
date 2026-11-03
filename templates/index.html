@@ -191,9 +191,26 @@
             <div id="pdf-placeholder" class="pdf-placeholder">
               <div class="pdf-placeholder-icon" aria-hidden="true">📄</div>
               <p class="pdf-placeholder-title">Select a data row to view its source PDF</p>
-              <p class="muted">The PDF viewer and annotation tools will appear in this space.</p>
+              <p class="muted">The evidence quote and the highlighted PDF will appear here.</p>
             </div>
-            <div id="selection-details" class="selection-details hidden"></div>
+            <div id="selection-details" class="selection-details hidden">
+              <div id="selection-summary"></div>
+              <div id="evidence-panel" class="evidence-placeholder">
+                <p class="field-label">Evidence</p>
+                <p id="evidence-text" class="evidence-text"></p>
+                <p id="evidence-meta" class="evidence-meta"></p>
+              </div>
+              <div class="pdf-slot">
+                <div class="pdf-slot-head">
+                  <p class="pdf-slot-title">Source PDF</p>
+                  <a id="pdf-new-tab" class="pdf-open-link" href="#" target="_blank"
+                     rel="noopener" hidden>Open in new tab ↗</a>
+                </div>
+                <p id="pdf-unavailable" class="pdf-unavailable hidden">No archived PDF for this paper — only the quote is available.</p>
+                <iframe id="pdf-viewer" class="pdf-viewer hidden"
+                        title="Annotated source PDF"></iframe>
+              </div>
+            </div>
           </aside>
         </div>
       </div>

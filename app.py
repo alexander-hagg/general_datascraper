@@ -29,6 +29,7 @@ import fetcher
 import filters
 import history
 import local_pdfs
+import pdf_annotations
 import searchers
 import suggester
 import writer
@@ -456,6 +457,8 @@ def _run_extract_job(job, goal, columns, mode="records"):
         job["log"].append(f"{len(todo)} paper(s) to process (already-done skipped).")
 
         n_extracted = n_closed = 0
+        n_evidence_located = n_evidence_unresolved = 0
+        n_annotation_warnings = 0
         first_write = True
         for i, p in enumerate(todo):
             k = paper_identity(p)
@@ -493,6 +496,34 @@ def _run_extract_job(job, goal, columns, mode="records"):
             out_rows = build_extract_rows(
                 p, records, field_names, pdf_file=pdf_file, pdf_source=pdf_source
             )
+
+            # Evidence is best-effort: locate the verbatim quotes and cache the
+            # highlighted PDF without ever failing the extraction job.
+            if getattr(config, "EVIDENCE_ENABLED", True) and pdf.get("path"):
+                try:
+                    out_rows, annotation_summary = pdf_annotations.annotate_paper_rows(
+                        out_rows,
+                        pdf.get("path"),
+                        paper_key=k,
+                        title=p.get("title", ""),
+                        pdf_file=pdf_file,
+                        pdf_source=pdf_source,
+                    )
+                    n_evidence_located += int(
+                        (annotation_summary or {}).get("located") or 0
+                    )
+                    n_evidence_unresolved += int(
+                        (annotation_summary or {}).get("unresolved") or 0
+                    )
+                    if (annotation_summary or {}).get("warning"):
+                        n_annotation_warnings += 1
+                    message = pdf_annotations.summary_message(annotation_summary)
+                    if message:
+                        job["log"].append(f"   -> {message}")
+                except Exception as exc:  # noqa: BLE001 - never fail extraction
+                    n_annotation_warnings += 1
+                    job["log"].append(f"   !! evidence warning: {exc}")
+
             if out_rows:
                 if fresh_output and first_write:
                     writer.write_xlsx(config.EXTRACTED_XLSX, extract_cols, out_rows)
@@ -520,6 +551,9 @@ def _run_extract_job(job, goal, columns, mode="records"):
             "closed": n_closed,
             "papers_processed": len(todo),
             "mode": mode,
+            "evidence_located": n_evidence_located,
+            "evidence_unresolved": n_evidence_unresolved,
+            "annotation_warnings": n_annotation_warnings,
         }
         job["status"] = "done"
         job["log"].append(f"Done: {n_extracted} row(s) extracted, {n_closed} paper(s) closed.")
@@ -879,13 +913,60 @@ def _sheet_with_paper_keys(sheet, allow_title=False):
     return {"header": header, "rows": rows}
 
 
+def _annotation_summary():
+    """Never let a corrupt/missing index break the results endpoint."""
+    try:
+        return pdf_annotations.api_summary()
+    except Exception:
+        return {}
+
+
 @app.route("/api/results")
 def api_results():
     return jsonify({
         "search": _sheet_with_paper_keys(_read_xlsx(config.SEARCH_RESULTS_XLSX), allow_title=True),
         "extracted": _sheet_with_paper_keys(_read_xlsx(config.EXTRACTED_XLSX)),
         "closed": _read_xlsx(config.CLOSED_SOURCE_XLSX),
+        "annotations": _annotation_summary(),
     })
+
+
+@app.route("/api/annotated-pdf/<path:paper_key>")
+def api_annotated_pdf(paper_key):
+    """Serve an annotated PDF, regenerating it or falling back to the original.
+
+    Only keys present in output/pdf_index.json are accepted. The index lookup
+    and path helpers reject absolute paths, traversal and files outside the
+    configured PDF folders, so this route can never serve arbitrary files.
+    """
+    try:
+        resolved = pdf_annotations.resolve_paper_paths(paper_key)
+    except Exception:
+        resolved = None
+    if not resolved:
+        abort(404)
+
+    annotation = resolved.get("annotation_path")
+    if annotation is not None:
+        return send_file(
+            str(annotation), mimetype="application/pdf", as_attachment=False
+        )
+
+    source = resolved.get("source_path")
+    if source is not None:
+        try:
+            regenerated = pdf_annotations.regenerate_annotation(paper_key)
+        except Exception:
+            regenerated = None
+        if regenerated is not None:
+            return send_file(
+                str(regenerated), mimetype="application/pdf", as_attachment=False
+            )
+        return send_file(
+            str(source), mimetype="application/pdf", as_attachment=False
+        )
+
+    abort(404)
 
 
 @app.route("/download/<name>")
