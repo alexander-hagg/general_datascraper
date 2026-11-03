@@ -69,6 +69,15 @@
 
       <label class="field-label" for="columns">Column names for the spreadsheet <span class="muted">(comma-separated, optional)</span></label>
       <input type="text" id="columns" placeholder="e.g. mutation, effect, position">
+      <p class="hint">Paper key, row number, evidence/page and PDF columns are added automatically; those names are reserved.</p>
+
+      <label class="field-label" for="extraction-mode">Extraction mode</label>
+      <select id="extraction-mode">
+        <option value="records" selected>Individual records — one row per distinct record</option>
+        <option value="table">Table rows — one row per row of a results table, never merged</option>
+      </select>
+      <p class="hint">Use <strong>Table rows</strong> when the paper reports a table and you want every
+        table row kept separate. Individual records is the safer default for prose and mixed papers.</p>
 
       <button class="primary-btn" id="extract-btn" onclick="doExtract()">Extract data</button>
     </section>
@@ -93,11 +102,39 @@
         </div>
       </div>
 
-      <h3 class="subhead">Papers found <span id="search-count" class="muted"></span></h3>
-      <div id="search-table" class="table-wrap"></div>
+      <div class="tabs" role="tablist" aria-label="Results views">
+        <button class="tab-btn active" id="tab-btn-search" role="tab" type="button"
+                aria-selected="true" aria-controls="tab-search" data-tab="search">Search &amp; Extract</button>
+        <button class="tab-btn" id="tab-btn-data" role="tab" type="button"
+                aria-selected="false" aria-controls="tab-data" data-tab="data" tabindex="-1">Data &amp; PDFs
+          <span id="data-tab-count" class="tab-count"></span></button>
+      </div>
 
-      <h3 class="subhead">Extracted data <span id="extracted-count" class="muted"></span></h3>
-      <div id="extracted-table" class="table-wrap"></div>
+      <div id="tab-search" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-search">
+        <h3 class="subhead">Papers found <span id="search-count" class="muted"></span></h3>
+        <div id="search-table" class="table-wrap"></div>
+        <p class="hint tab-hint">Extracted rows are grouped by paper in the <strong>Data &amp; PDFs</strong> tab.</p>
+      </div>
+
+      <div id="tab-data" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-btn-data">
+        <div class="data-layout">
+          <div class="data-main">
+            <div class="data-summary">
+              <span id="extracted-count" class="muted"></span>
+              <span id="paper-group-count" class="muted"></span>
+            </div>
+            <div id="data-groups"></div>
+          </div>
+          <aside class="pdf-pane" aria-label="Selected paper and PDF">
+            <div id="pdf-placeholder" class="pdf-placeholder">
+              <div class="pdf-placeholder-icon" aria-hidden="true">📄</div>
+              <p class="pdf-placeholder-title">Select a data row to view its source PDF</p>
+              <p class="muted">The PDF viewer and annotation tools will appear in this space.</p>
+            </div>
+            <div id="selection-details" class="selection-details hidden"></div>
+          </aside>
+        </div>
+      </div>
     </section>
 
     <details class="card settings">

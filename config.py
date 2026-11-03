@@ -78,6 +78,12 @@ MAX_CHARS   = 90000      # cap each paper at this many characters before asking 
 
 # ==================== 3. EXTRACTION: what to pull out ====================
 
+# How the CLI treats the model's answer by default:
+#   "records" -> one row per distinct record (default)
+#   "table"   -> one row per row of a results table; rows are never merged
+# The web app lets you pick this per Extract run.
+EXTRACTION_MODE = "records"
+
 # Plain-English instructions to the model: what a "record" is, what to skip.
 INSTRUCTION = """\
 You are a careful research assistant. Read the TEXT below and extract every

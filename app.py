@@ -39,6 +39,14 @@ from main import (
     _closed_row,
     _load_search_results,
     _prepare_paper,
+    build_extract_rows,
+    extract_columns,
+    extract_user_columns,
+    make_instruction,
+    normalize_extraction_mode,
+    paper_identity,
+    paper_to_row,
+    validate_user_columns,
 )
 
 app = Flask(__name__)
@@ -139,18 +147,7 @@ def _job_public(job):
 # --------------------------------------------------------------------------
 
 def _paper_to_row(p):
-    return {
-        "source": ", ".join(p.get("sources", [])),
-        "title": p.get("title", ""),
-        "authors": p.get("authors", ""),
-        "doi": p.get("doi", ""),
-        "pmid": p.get("pmid", ""),
-        "pmcid": p.get("pmcid", ""),
-        "year": p.get("year", ""),
-        "journal": p.get("journal", ""),
-        "is_open_access": p.get("is_oa"),
-        "fulltext_url": p.get("fulltext_url", ""),
-    }
+    return paper_to_row(p)
 
 
 def _run_search_job(job, query, sources, max_results):
@@ -177,22 +174,6 @@ def _run_search_job(job, query, sources, max_results):
         job["log"].append(f"Error: {e}")
 
 
-def make_instruction(goal):
-    goal = (goal or "").strip() or "Extract the relevant data described in the text."
-    return (
-        "You are an expert research assistant. Read the full paper TEXT below very carefully.\n"
-        f"Task: {goal}\n\n"
-        "IMPORTANT RULES:\n"
-        "- Extract EVERY record that matches the task. Do not skip any, and do not merge\n"
-        "  separate records into one row.\n"
-        "- NEVER invent, guess, or use outside knowledge. Only report what is explicitly\n"
-        "  written in the TEXT. If it is not in the paper, do not put it in the answer.\n"
-        "- If a value is missing, leave that field empty — do not make one up.\n"
-        "- Keep wording and values consistent with how they appear in the paper.\n"
-        "- If no record matches the task, return an empty list []."
-    )
-
-
 def _read_header(path):
     p = Path(path)
     if not p.exists():
@@ -207,26 +188,55 @@ def _read_header(path):
         return None
 
 
-def _run_extract_job(job, goal, columns):
+def _run_extract_job(job, goal, columns, mode="records"):
     try:
         apply_settings(load_settings())
-        columns = [c.strip() for c in columns if c and str(c).strip()]
+        mode = normalize_extraction_mode(mode)
+        columns, errors = validate_user_columns(columns)
+        if errors:
+            job["status"] = "error"
+            job["error"] = " ".join(errors)
+            job["log"].append(f"Error: {job['error']}")
+            return
+
         fields = [(c, "text") for c in columns] if columns else list(config.FIELDS)
         field_names = [f[0] for f in fields]
-        instruction = make_instruction(goal)
-        extract_cols = ["doi", "source", "pdf_file", "pdf_source"] + field_names
+        instruction = make_instruction(goal, mode=mode)
+        extract_cols = extract_columns(field_names)
+
+        job["log"].append(f"Extraction mode: {mode}")
 
         papers = _load_search_results(required=False)
         if not papers:
             job["status"] = "done"
-            job["result"] = {"extracted": 0, "closed": 0, "papers_processed": 0}
+            job["result"] = {
+                "extracted": 0,
+                "closed": 0,
+                "papers_processed": 0,
+                "mode": mode,
+            }
             job["log"].append("No search results yet — run a search first.")
             return
+
+        # Decide whether the existing sheet belongs to the same user fields.
+        # Technical columns may grow/reorder; that is migrated in place. A real
+        # change to the user's field list keeps the old documented behaviour:
+        # the first write starts a fresh extracted_data.xlsx.
+        existing_header = _read_header(config.EXTRACTED_XLSX)
+        same_fields = bool(existing_header) and (
+            extract_user_columns(existing_header) == field_names
+        )
+        fresh_output = bool(existing_header) and not same_fields
+        if not fresh_output:
+            writer.ensure_columns(config.EXTRACTED_XLSX, extract_cols)
+            writer.backfill_paper_keys(config.EXTRACTED_XLSX)
 
         cp = Checkpoint(config.CHECKPOINT_JSON)
         todo, seen = [], set()
         for p in papers:
-            k = searchers.paper_key(p)
+            k = paper_identity(p)
+            if not k:
+                continue
             if k in seen:
                 continue
             seen.add(k)
@@ -240,7 +250,7 @@ def _run_extract_job(job, goal, columns):
         n_extracted = n_closed = 0
         first_write = True
         for i, p in enumerate(todo):
-            k = searchers.paper_key(p)
+            k = paper_identity(p)
             title = (p.get("title") or "")[:60]
             job["progress"]["done"] = i
             job["progress"]["current"] = title
@@ -271,26 +281,14 @@ def _run_extract_job(job, goal, columns):
                 job["log"].append(f"   !! extract error: {e}")
                 continue
 
-            rows = [r for r in rows if isinstance(r, dict)]
-            out_rows = [
-                {
-                    "doi": p.get("doi", ""),
-                    "source": ", ".join(p.get("sources", [])),
-                    "pdf_file": pdf_file,
-                    "pdf_source": pdf_source,
-                }
-                | {f: r.get(f, "") for f in field_names}
-                for r in rows
-            ]
+            records = [r for r in rows if isinstance(r, dict)]
+            out_rows = build_extract_rows(
+                p, records, field_names, pdf_file=pdf_file, pdf_source=pdf_source
+            )
             if out_rows:
-                if first_write:
-                    existing_header = _read_header(config.EXTRACTED_XLSX)
-                    if existing_header == extract_cols:
-                        writer.append_xlsx(config.EXTRACTED_XLSX, extract_cols, out_rows)
-                    else:
-                        writer.write_xlsx(config.EXTRACTED_XLSX, extract_cols, out_rows)
-                        if existing_header:
-                            job["log"].append("   (columns changed — started a fresh extracted_data.xlsx)")
+                if fresh_output and first_write:
+                    writer.write_xlsx(config.EXTRACTED_XLSX, extract_cols, out_rows)
+                    job["log"].append("   (columns changed — started a fresh extracted_data.xlsx)")
                     first_write = False
                 else:
                     writer.append_xlsx(config.EXTRACTED_XLSX, extract_cols, out_rows)
@@ -309,7 +307,12 @@ def _run_extract_job(job, goal, columns):
 
         job["progress"]["done"] = len(todo)
         job["progress"]["current"] = ""
-        job["result"] = {"extracted": n_extracted, "closed": n_closed, "papers_processed": len(todo)}
+        job["result"] = {
+            "extracted": n_extracted,
+            "closed": n_closed,
+            "papers_processed": len(todo),
+            "mode": mode,
+        }
         job["status"] = "done"
         job["log"].append(f"Done: {n_extracted} row(s) extracted, {n_closed} paper(s) closed.")
     except Exception as e:
@@ -444,10 +447,20 @@ def api_extract():
     columns = data.get("columns") or []
     if not goal:
         return jsonify({"error": "Describe what data you want to extract."}), 400
-    job, err = _start_job("extract", _run_extract_job, goal, columns)
+
+    try:
+        mode = normalize_extraction_mode(data.get("mode") or "records")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    columns, errors = validate_user_columns(columns)
+    if errors:
+        return jsonify({"error": " ".join(errors)}), 400
+
+    job, err = _start_job("extract", _run_extract_job, goal, columns, mode)
     if err:
         return jsonify({"error": err}), 409
-    return jsonify({"job_id": job["id"]})
+    return jsonify({"job_id": job["id"], "mode": mode})
 
 
 @app.route("/api/job/<job_id>")
@@ -476,11 +489,53 @@ def _read_xlsx(path):
     return {"header": header, "rows": data}
 
 
+def _sheet_with_paper_keys(sheet, allow_title=False):
+    """Add paper_key values to a search/extracted sheet response.
+
+    Files written by older versions have no paper_key column. This derives it
+    in memory (PMID/DOI only for extracted rows; title is also allowed for
+    search rows) without touching the workbook, so the API shape stays
+    `{header, rows}` and legacy data remains usable.
+    """
+    if not sheet:
+        return sheet
+    header = list(sheet.get("header") or [])
+    rows = [list(row) for row in (sheet.get("rows") or [])]
+
+    if "paper_key" in header:
+        key_index = header.index("paper_key")
+    else:
+        key_index = len(header)
+        header.append("paper_key")
+        for row in rows:
+            row.append("")
+
+    def derive(values):
+        pmid = str(values.get("pmid") or "").strip()
+        if pmid:
+            return f"pmid:{pmid}"
+        doi = str(values.get("doi") or "").strip()
+        if doi:
+            return f"doi:{doi.lower()}"
+        if allow_title:
+            return paper_identity(values)
+        return ""
+
+    for row in rows:
+        if len(row) <= key_index:
+            row.extend([""] * (key_index + 1 - len(row)))
+        if str(row[key_index] or "").strip():
+            continue
+        row[key_index] = derive(dict(zip(header, row)))
+
+    return {"header": header, "rows": rows}
+
+
 @app.route("/api/results")
 def api_results():
     return jsonify({
-        "search": _read_xlsx(config.SEARCH_RESULTS_XLSX),
-        "extracted": _read_xlsx(config.EXTRACTED_XLSX),
+        "search": _sheet_with_paper_keys(_read_xlsx(config.SEARCH_RESULTS_XLSX), allow_title=True),
+        "extracted": _sheet_with_paper_keys(_read_xlsx(config.EXTRACTED_XLSX)),
         "closed": _read_xlsx(config.CLOSED_SOURCE_XLSX),
     })
 
