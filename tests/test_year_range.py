@@ -376,6 +376,18 @@ class SearchJobYearRangeTests(unittest.TestCase):
         self.assertEqual(calls, [("A", ["pubmed"], 10, None, None)])
         self.assertEqual(job["result"]["year_range"], "all years")
 
+    def test_explicit_none_bounds_do_not_fall_back_to_saved_settings(self):
+        # /api/search normalizes blank inputs to None before starting the job.
+        job, calls = self._run_job(
+            {},
+            saved_settings={"year_from": "2015", "year_to": "2020"},
+            year_from=None,
+            year_to=None,
+        )
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(calls, [("A", ["pubmed"], 10, None, None)])
+        self.assertEqual(job["result"]["year_range"], "all years")
+
     def test_one_explicit_bound_keeps_the_other_side_open(self):
         _, calls = self._run_job(
             {},

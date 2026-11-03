@@ -183,8 +183,11 @@ def _paper_to_row(p):
     return paper_to_row(p)
 
 
+_YEARS_UNSET = object()
+
+
 def _run_search_job(job, query, sources, max_results, excluded_journals=None,
-                    year_from=None, year_to=None):
+                    year_from=_YEARS_UNSET, year_to=_YEARS_UNSET):
     try:
         settings = load_settings()
         apply_settings(settings)
@@ -192,11 +195,18 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None,
         # web setting, which itself defaults to config.EXCLUDED_JOURNALS.
         if excluded_journals is None:
             excluded_journals = settings.get("excluded_journals")
-        # Likewise, both bounds omitted means "use the saved setting". An
-        # explicit blank on either side still means an open end (no limit).
-        if year_from is None and year_to is None:
+        # Both bounds omitted means "use the saved setting". The API always
+        # passes both values (possibly normalized None/None after the user
+        # cleared the boxes), and an explicit None is an open end, not a
+        # request to reuse the saved range.
+        if year_from is _YEARS_UNSET and year_to is _YEARS_UNSET:
             year_from = settings.get("year_from")
             year_to = settings.get("year_to")
+        else:
+            if year_from is _YEARS_UNSET:
+                year_from = None
+            if year_to is _YEARS_UNSET:
+                year_to = None
         year_from, year_to = searchers.normalize_year_range(year_from, year_to)
         range_label = searchers.year_range_label(year_from, year_to)
 
