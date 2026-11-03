@@ -39,10 +39,10 @@ shows **Cancelling…** until the job exits. A cancelled job is reported as
   checkpoint entry and closed-source entry are saved, then the job stops before
   the next paper. Running Extract again later resumes with the unprocessed
   papers; completed papers are skipped as usual.
-- Cancellation is cooperative. A PubMed/Europe PMC/Crossref request or an LLM
-  call that is already in progress cannot be interrupted, so the job stops when
-  that call returns. Clicking Cancel near the end may therefore let the last
-  step finish before the job ends.
+- Cancellation is cooperative. A PubMed/Europe PMC/Crossref/ChemRxiv request or
+  an LLM call that is already in progress cannot be interrupted, so the job stops
+  when that call returns. Clicking Cancel near the end may therefore let the
+  last step finish before the job ends.
 
 
 ## Search & Extract vs Data & PDFs
@@ -53,7 +53,8 @@ The results area has two tabs:
 - **Data & PDFs** appears as soon as there are extracted rows (or detected
   figures). It groups those rows by paper, so you can see at a glance which
   paper each row came from. Each group shows the paper title, journal, year and
-  how many rows belong to it; the rows themselves are listed underneath. Rows
+  how many rows belong to it (with a **preprint** badge when applicable); the
+  rows themselves are listed underneath. Rows
   whose paper cannot be identified are collected in a clearly labelled
   **Unlinked rows** group. A full-width **Figures** gallery below the table
   shows the screenshots ScrapeLite detected in the archived PDFs (see
@@ -67,6 +68,38 @@ highlighted; **Open in new tab ↗** opens the same PDF in its own browser tab.
 If no PDF was archived, the viewer is hidden and the quote panel remains as the
 fallback. The technical `paper_key` column is used behind the scenes and is not
 shown in the data tables; your own extracted columns are always shown.
+
+
+## Search websites and preprint marking
+
+The **Websites to search** checkboxes are built from the sources that
+ScrapeLite knows about: **PubMed**, **Europe PMC**, **Crossref** and
+**ChemRxiv**. All four are selected by default. Deselect any you do not want,
+or remove one from `SOURCES` in `config.py` for command-line searches.
+
+**ChemRxiv** is searched through **Crossref metadata**, not through the
+chemrxiv.org website. Crossref indexes ChemRxiv postings under DOI prefix
+`10.26434`; ScrapeLite asks Crossref for `type:posted-content` records with that
+prefix, then keeps only DOIs that actually contain `chemrxiv`. This avoids the
+official ChemRxiv API, which currently sits behind a Cloudflare browser
+challenge and returns an HTML "Just a moment..." page instead of JSON to normal
+programmatic requests. No request is sent to chemrxiv.org.
+
+ChemRxiv results are always marked as a **preprint**:
+
+- `publication_type` is `preprint` in `search_results.xlsx` and
+  `extracted_data.xlsx` (other online records are `journal article`; local-only
+  PDFs are `local PDF`).
+- The web **Search & Extract** table shows a **type** column with the literal
+  value `preprint`.
+- The **Data & PDFs** paper group header shows a small amber **preprint** badge.
+- The journal name falls back to `ChemRxiv`, the year comes from Crossref's
+  `posted` date (falling back to `published`), and the open-access PDF link from
+  Crossref is preferred when it looks like a PDF.
+
+Marking preprints matters when you compare results: a preprint has not
+necessarily been peer reviewed, even though its metadata and PDF are available
+through the same pipeline as journal articles.
 
 
 ## Extraction modes
@@ -104,16 +137,24 @@ next time extraction runs, without losing any rows or values. Where an older
 extracted row has a DOI, the key is filled in from that DOI; rows with no
 identifying information are left blank and appear under **Unlinked rows**.
 
+`search_results.xlsx` and `extracted_data.xlsx` also carry a
+`publication_type` column: `journal article` for PubMed, Europe PMC and
+Crossref journal records, `preprint` for ChemRxiv postings, and `local PDF` for
+papers that came only from a local folder. The **Search & Extract** table shows
+this as the **type** column, and **Data & PDFs** puts a small **preprint** badge
+next to the paper title. Older workbooks without the column still open safely;
+it is added with blank values the next time a search or extraction writes them.
+
 `extracted_data.xlsx` also has reserved `evidence` and `evidence_page` columns.
 `evidence` holds the model's verbatim supporting quote; `evidence_page` is the
 1-based page where ScrapeLite located that quote in the archived PDF (blank when
 the quote could not be located or no PDF was archived). The names `paper_key`,
-`row_index`, `evidence`, `evidence_page`, `pdf_file`, `pdf_source`, plus the
-existing `doi` and `source` metadata columns, cannot be used as your own
-column names; the app asks you to rename them if you try. Duplicate column
-names (ignoring case) are rejected as well, so the Excel header stays
-unambiguous. Older workbooks gain the new columns automatically on the next
-extraction run.
+`row_index`, `publication_type`, `evidence`, `evidence_page`, `pdf_file`,
+`pdf_source`, plus the existing `doi` and `source` metadata columns, cannot be
+used as your own column names; the app asks you to rename them if you try.
+Duplicate column names (ignoring case) are rejected as well, so the Excel
+header stays unambiguous. Older workbooks gain the new columns automatically on
+the next extraction run.
 
 
 
@@ -228,10 +269,10 @@ Things to know:
 - The list is saved with the other web settings, so it comes back the next time
   you open the app. A search also saves it automatically, without clicking
   **Save settings**.
-- Journal exclusions are **not** pushed into PubMed, Europe PMC or Crossref
-  queries. In particular, Crossref's `query` parameter is relevance-based rather
-  than strict boolean matching, so the blocklist is the only reliable way to
-  remove those records.
+- Journal exclusions are **not** pushed into PubMed, Europe PMC, Crossref or
+  ChemRxiv queries. In particular, Crossref's (and therefore ChemRxiv's) `query`
+  parameter is relevance-based rather than strict boolean matching, so the
+  blocklist is the only reliable way to remove those records.
 
 
 ## Publication-year range
@@ -279,6 +320,10 @@ How each website applies it:
   metadata it has, so records with incomplete dates can behave differently.
   As with every Crossref search, the query itself stays relevance-based rather
   than strict boolean matching.
+- **ChemRxiv** uses the same Crossref API but filters on
+  `from-posted-date:YYYY-01-01` / `until-posted-date:YYYY-12-31`, because
+  preprints are dated by their `posted` date. The type filter is
+  `type:posted-content` and the prefix is `10.26434`.
 
 Journal exclusions remain a post-search filter and apply on top of the year
 range. The year range is pushed into each website's query, so it also affects
@@ -334,7 +379,7 @@ The same workflow is available from the command line:
 # Add local PDFs to a normal config.py search
 python main.py --search-only --local-folder "C:\Users\me\Papers" --recursive
 
-# Folder-only: no PubMed/Europe PMC/Crossref search at all
+# Folder-only: no PubMed/Europe PMC/Crossref/ChemRxiv search at all
 python main.py --search-only --local-folder "C:\Users\me\Papers" --local-only
 
 # Search + extract in one run

@@ -304,10 +304,11 @@ class InstructionAndModeTests(unittest.TestCase):
     def test_extract_columns_include_reserved_placeholders(self):
         columns = main.extract_columns(["mutation"])
         self.assertEqual(columns, [
-            "paper_key", "row_index", "doi", "source",
+            "paper_key", "row_index", "doi", "source", "publication_type",
             "pdf_file", "pdf_source", "evidence", "evidence_page", "mutation",
         ])
         self.assertIn("paper_key", main.SEARCH_COLS)
+        self.assertIn("publication_type", main.SEARCH_COLS)
 
 
 class ColumnValidationTests(unittest.TestCase):

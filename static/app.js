@@ -1590,7 +1590,21 @@ function findSearchMatch(obj, index) {
 }
 
 function columnLabel(name) {
-  return name === "row_index" ? "#" : name;
+  if (name === "row_index") return "#";
+  if (name === "publication_type") return "type";
+  return name;
+}
+
+function publicationType(obj) {
+  return cleanValue(obj && obj.publication_type).toLowerCase();
+}
+
+// A paper group is a preprint when its search record or any of its extracted
+// rows says so (old extracted rows may predate the search-row backfill).
+function isPreprintGroup(group) {
+  if (!group) return false;
+  if (publicationType(group.paper) === "preprint") return true;
+  return (group.rows || []).some(row => publicationType(row.obj) === "preprint");
 }
 
 function setResultsTab(name, focus) {
@@ -1722,6 +1736,12 @@ function renderTable(containerId, header, rows, options) {
         td.className = v === "yes" ? "oa-yes" : "oa-no";
         v = v === "yes" ? "open" : (v === "no" ? "closed" : "");
       }
+      if (col.name === "publication_type") {
+        td.className = "pub-type";
+        if (v.trim().toLowerCase() === "preprint") {
+          td.classList.add("pub-type-preprint");
+        }
+      }
       td.textContent = v;
       tr.appendChild(td);
     });
@@ -1809,8 +1829,14 @@ function renderDataGroups(extracted, searchIndex, annotations) {
     const heading = document.createElement("div");
     heading.className = "data-group-heading";
 
-    const title = makeEl("h4", "data-group-title", groupTitle(group));
-    heading.appendChild(title);
+    const titleRow = makeEl("div", "data-group-title-row");
+    titleRow.appendChild(makeEl("h4", "data-group-title", groupTitle(group)));
+    if (isPreprintGroup(group)) {
+      const preprintBadge = makeEl("span", "data-group-badge data-group-badge-preprint", "preprint");
+      preprintBadge.title = "Preprint (not a peer-reviewed journal article)";
+      titleRow.appendChild(preprintBadge);
+    }
+    heading.appendChild(titleRow);
 
     if (group.paper) {
       const meta = [

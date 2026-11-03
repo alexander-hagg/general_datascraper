@@ -1060,6 +1060,31 @@ def _sheet_with_paper_keys(sheet, allow_title=False):
     return {"header": header, "rows": rows}
 
 
+def _sheet_with_publication_type(sheet):
+    """Expose the pipeline's publication_type column for legacy workbooks.
+
+    The file itself is migrated by writer.ensure_columns the next time a search
+    or extraction runs. Reading an old sheet must still return a consistent
+    shape for the web table, so a missing column is appended in memory with
+    blank values (never losing or reordering existing data).
+    """
+    if not sheet:
+        return sheet
+    header = list(sheet.get("header") or [])
+    if "publication_type" in header:
+        return sheet
+    old_width = len(header)
+    header.append("publication_type")
+    rows = []
+    for row in (sheet.get("rows") or []):
+        values = list(row)
+        if len(values) < old_width:
+            values.extend([""] * (old_width - len(values)))
+        values.append("")
+        rows.append(values)
+    return {"header": header, "rows": rows}
+
+
 def _annotation_summary():
     """Never let a corrupt/missing index break the results endpoint."""
     try:
@@ -1079,9 +1104,13 @@ def _figure_list(paper_key=None):
 @app.route("/api/results")
 def api_results():
     return jsonify({
-        "search": _sheet_with_paper_keys(_read_xlsx(config.SEARCH_RESULTS_XLSX), allow_title=True),
-        "extracted": _sheet_with_paper_keys(_read_xlsx(config.EXTRACTED_XLSX)),
-        "closed": _read_xlsx(config.CLOSED_SOURCE_XLSX),
+        "search": _sheet_with_publication_type(
+            _sheet_with_paper_keys(_read_xlsx(config.SEARCH_RESULTS_XLSX), allow_title=True)
+        ),
+        "extracted": _sheet_with_publication_type(
+            _sheet_with_paper_keys(_read_xlsx(config.EXTRACTED_XLSX))
+        ),
+        "closed": _sheet_with_publication_type(_read_xlsx(config.CLOSED_SOURCE_XLSX)),
         "annotations": _annotation_summary(),
         "figures": _figure_list(),
     })

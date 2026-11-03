@@ -139,6 +139,7 @@ class ScanFolderTests(LocalPdfTestBase):
         self.assertEqual(paper["pmid"], "")
         self.assertEqual(paper["pmcid"], "")
         self.assertEqual(paper["journal"], "")
+        self.assertEqual(paper["publication_type"], "local PDF")
         self.assertTrue(paper["is_oa"])
         self.assertTrue(paper["local_pdf"].startswith("local_"))
         self.assertTrue(paper["local_pdf"].endswith(".pdf"))

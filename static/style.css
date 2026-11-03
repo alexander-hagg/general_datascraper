@@ -302,6 +302,8 @@ th { background: #f8fafc; font-weight: 600; white-space: nowrap; position: stick
 tr:last-child td { border-bottom: none; }
 td.oa-yes { color: var(--green); font-weight: 600; }
 td.oa-no { color: var(--muted); }
+td.pub-type { white-space: nowrap; color: var(--muted); }
+td.pub-type-preprint { color: #92400e; font-weight: 600; }
 
 /* Results tabs */
 .tabs {
@@ -336,7 +338,17 @@ td.oa-no { color: var(--muted); }
 }
 .data-group.unlinked .data-group-head { background: var(--amber-bg); }
 .data-group-heading { min-width: 0; }
+.data-group-title-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
 .data-group-title { margin: 0; font-size: 0.92rem; line-height: 1.35; }
+.data-group-badge {
+  flex: none; border-radius: 999px; padding: 1px 8px;
+  font-size: 0.68rem; font-weight: 700; letter-spacing: 0.02em;
+}
+.data-group-badge-preprint {
+  background: var(--amber-bg); color: #92400e; border: 1px solid #fde68a;
+}
 .data-group-meta { margin: 3px 0 0; color: var(--muted); font-size: 0.8rem; }
 .data-group-key {
   display: inline-block; margin-top: 4px; color: var(--muted);

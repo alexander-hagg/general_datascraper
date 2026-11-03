@@ -60,7 +60,8 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   `app.py` records after search/extract validation and before scanning or
   processing; a history failure is logged as a warning and never fails the job.
   Never record email/API keys/model/backend secrets here.
-- `searchers.py`: API clients + `SOURCE_REGISTRY`. To add a source, implement
+- `searchers.py`: API clients + `SOURCE_REGISTRY` (`pubmed`, `europepmc`,
+  `crossref`, `chemrxiv`). To add a source, implement
   `search_<name>(query, limit=None, year_from=None, year_to=None)` returning
   paper dicts and add one registry entry; the UI and `/api/sources` list it
   automatically. `normalize_year_range()` is the shared validator: it returns
@@ -69,7 +70,20 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   PMID > lowercased DOI > lowercased title (`paper_key`). `search()` and
   `search_all()` accept an optional `cancel_check` callable and raise
   `SearchCancelled` between sources/queries; in-flight HTTP requests always
-  finish. Omitting `cancel_check` keeps the old behaviour.
+  finish. Omitting `cancel_check` keeps the old behaviour. Paper dicts carry
+  `publication_type`: `journal article` (PubMed/Europe PMC/Crossref),
+  `preprint` (ChemRxiv) or `local PDF` (local-only records); `_merge_into()`
+  backfills it on dedup like the other metadata fields.
+- ChemRxiv is searched **through Crossref**, never chemrxiv.org: the official
+  public API is behind a Cloudflare browser challenge (HTTP 403 "Just a
+  moment..."). `search_chemrxiv()` sends `filter=type:posted-content,
+  prefix:10.26434`, optionally `from-posted-date`/`until-posted-date`, then
+  keeps only DOIs whose lowercased value contains `chemrxiv` (the prefix alone
+  is not exclusive). It reuses `_crossref_to_paper()` with
+  `date_keys=("posted", "published")`, `publication_type="preprint"`,
+  `journal_fallback="ChemRxiv"`, `is_oa=True` and PDF-first link selection;
+  journal Crossref behavior is unchanged. Crossref returns the ChemRxiv PDF
+  as `https://chemrxiv.org/doi/pdf/<doi>` in `link`.
 - `fetcher.py`: full text via PMC XML → source-provided OA URL → Unpaywall;
   rejects bodies under 500 chars.
 - `pdf_fetcher.py`: archiving runs only during Extract, not Search. Article PDF
@@ -128,8 +142,12 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   the right (`iframe#pdf-viewer`, annotations metadata by `row_index`, page
   anchor, "Open in new tab"); mobile stacks the pane below the table. The quote
   panel is the fallback because browser PDF viewers vary in highlight support.
-  A full-width `#figures-section` below `.data-layout` renders `data.figures`
-  as paper-grouped lazy thumbnails (`/api/figure/<id>`) with a no-dependency
+  The data group header shows an amber `preprint` badge when the search record
+  or any extracted row has `publication_type == "preprint"` (`isPreprintGroup`);
+  the Search table renders the generic `publication_type` column as `type` and
+  highlights `preprint` cells. A full-width `#figures-section` below
+  `.data-layout` renders `data.figures` as paper-grouped lazy thumbnails
+  (`/api/figure/<id>`) with a no-dependency
   lightbox (backdrop/Escape/close, label, page, caption, new-tab link); the
   section and `figures.xlsx` buttons are hidden when the list is empty.
   `#progress-card` also hosts the `#cancel-job` button: it is visible only while
@@ -226,8 +244,20 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   PubMed `datetype=pdat` + `mindate`/`maxdate`; Europe PMC
   `PUB_YEAR:[from TO to]` (open ends `1000`/`3000`); Crossref
   `from-pub-date:YYYY-01-01` / `until-pub-date:YYYY-12-31` appended to the
-  `type:journal-article` filter. Source clients validate direct calls;
-  `search()`/`search_all()` validate once up front.
+  `type:journal-article` filter; ChemRxiv
+  `from-posted-date:YYYY-01-01` / `until-posted-date:YYYY-12-31` appended to
+  the `type:posted-content,prefix:10.26434` filters. Source clients validate
+  direct calls; `search()`/`search_all()` validate once up front.
+- **`publication_type` is pipeline metadata, never a user field:** it is in
+  `SEARCH_COLS`, `CLOSED_COLS`, `EXTRACT_META_COLUMNS`, `RESERVED_COLUMNS` and
+  (via RESERVED) `PROTECTED_COLUMNS`, so web column validation rejects it.
+  `paper_to_row()` and `build_extract_rows()` copy it onto every row;
+  `_load_search_results()` reads it and calls `writer.ensure_columns()` so an
+  old search sheet gains a blank column without losing data. `api_results()`
+  adds the same blank column in memory for legacy sheets, and extract migration
+  already uses `writer.ensure_columns()`. Values are `journal article`,
+  `preprint` and `local PDF`; keep them lowercase/stable because the UI checks
+  `publication_type == "preprint"` for the badge.
 - Web Extract lets the user supply columns, which override `config.FIELDS` for
   that run (all treated as text). If the column header changes, the app starts a
   fresh `extracted_data.xlsx`; the CLI always uses `config.FIELDS`/`INSTRUCTION`.
