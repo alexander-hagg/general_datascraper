@@ -30,6 +30,19 @@ EUROPEPMC_MIN_YEAR = "1000"
 EUROPEPMC_MAX_YEAR = "3000"
 
 
+class SearchCancelled(Exception):
+    """Raised when a caller's cooperative cancellation check returns True.
+
+    Cancellation is checked between sources and between queries, never inside a
+    source's HTTP request, so an in-flight request always finishes first.
+    """
+
+
+def _check_cancel(cancel_check):
+    if cancel_check is not None and cancel_check():
+        raise SearchCancelled()
+
+
 def _normalize_year(value):
     """Return one optional publication year as a 4-digit string or None."""
     if value is None:
@@ -120,16 +133,21 @@ def merge_papers(existing, incoming):
     return list(papers.values())
 
 
-def search(query, sources, limit=None, year_from=None, year_to=None):
+def search(query, sources, limit=None, year_from=None, year_to=None,
+           cancel_check=None):
     """Search ONE query across the given sources. Returns a merged, deduped list.
 
     Used by the web app (the UI sends a query string + a list of source names).
     `year_from`/`year_to` are validated once here and forwarded to each source.
+    An optional `cancel_check` callable is evaluated before each source; when it
+    returns a truthy value a `SearchCancelled` is raised. A source that already
+    started always finishes, because HTTP calls cannot be interrupted.
     """
     year_from, year_to = normalize_year_range(year_from, year_to)
     range_note = year_range_label(year_from, year_to)
     papers = {}
     for source in sources:
+        _check_cancel(cancel_check)
         entry = SOURCE_REGISTRY.get(source)
         if entry is None:
             print(f"  !! unknown source '{source}' (valid: {', '.join(SOURCE_REGISTRY)}) - skipping")
@@ -148,14 +166,20 @@ def search(query, sources, limit=None, year_from=None, year_to=None):
     return list(papers.values())
 
 
-def search_all(limit=None, year_from=None, year_to=None):
-    """CLI helper: run every config.SOURCES x config.QUERIES, merge and dedup."""
+def search_all(limit=None, year_from=None, year_to=None, cancel_check=None):
+    """CLI helper: run every config.SOURCES x config.QUERIES, merge and dedup.
+
+    `cancel_check` is forwarded to `search()`, which evaluates it before every
+    source; `search_all()` also evaluates it before every query.
+    """
     year_from, year_to = normalize_year_range(year_from, year_to)
     papers = {}
     for q in config.QUERIES:
-        for p in search(
-            q, config.SOURCES, limit=limit, year_from=year_from, year_to=year_to
-        ):
+        _check_cancel(cancel_check)
+        kwargs = {"limit": limit, "year_from": year_from, "year_to": year_to}
+        if cancel_check is not None:
+            kwargs["cancel_check"] = cancel_check
+        for p in search(q, config.SOURCES, **kwargs):
             _merge_into(papers, p)
     return list(papers.values())
 

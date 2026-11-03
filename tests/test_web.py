@@ -249,6 +249,7 @@ class ExtractJobMigrationTests(unittest.TestCase):
                 web._run_extract_job(job, "Extract mutations", ["mutation"], mode="records")
 
             self.assertEqual(job["status"], "done")
+            self.assertFalse(job["result"]["cancelled"])
             table = read_sheet(extracted)
             header = table[0]
             self.assertIn("paper_key", header)
@@ -628,7 +629,8 @@ class SearchJobJournalTests(unittest.TestCase):
                  mock.patch.object(web, "load_settings", lambda: {}), \
                  mock.patch.object(
                      web.searchers, "search",
-                     lambda query, sources, limit=None, year_from=None, year_to=None:
+                     lambda query, sources, limit=None, year_from=None, year_to=None,
+                            cancel_check=None:
                          list(papers),
                  ):
                 web._run_search_job(
@@ -672,7 +674,8 @@ class SearchJobJournalTests(unittest.TestCase):
                  ), \
                  mock.patch.object(
                      web.searchers, "search",
-                     lambda query, sources, limit=None, year_from=None, year_to=None:
+                     lambda query, sources, limit=None, year_from=None, year_to=None,
+                            cancel_check=None:
                          list(papers),
                  ):
                 web._run_search_job(job, "A", ["pubmed"], 10)
@@ -801,7 +804,8 @@ class SearchJobLocalTests(unittest.TestCase):
                  ), \
                  mock.patch.object(
                      web.searchers, "search",
-                     lambda query, sources, limit=None, year_from=None, year_to=None:
+                     lambda query, sources, limit=None, year_from=None, year_to=None,
+                            cancel_check=None:
                          [dict(online)],
                  ):
                 web._run_search_job(
@@ -838,7 +842,8 @@ class SearchJobLocalTests(unittest.TestCase):
                  mock.patch.object(web, "load_settings", lambda: {}), \
                  mock.patch.object(
                      web.searchers, "search",
-                     lambda query, sources, limit=None, year_from=None, year_to=None: [],
+                     lambda query, sources, limit=None, year_from=None, year_to=None,
+                            cancel_check=None: [],
                  ):
                 web._run_search_job(job, "A", ["pubmed"], 10, [], None, None, "", False)
 
@@ -959,7 +964,8 @@ class SearchJobHistoryTests(unittest.TestCase):
             ),
             mock.patch.object(
                 web.searchers, "search",
-                lambda query, sources, limit=None, year_from=None, year_to=None: [],
+                lambda query, sources, limit=None, year_from=None, year_to=None,
+                       cancel_check=None: [],
             ),
         ]
         with contextlib.ExitStack() as stack:
@@ -1305,6 +1311,305 @@ class ExtractJobEvidenceTests(unittest.TestCase):
         self.assertIn(objects[0]["evidence_page"], (None, ""))
 
 
+class JobCancelApiTests(unittest.TestCase):
+    def setUp(self):
+        self.client = web.app.test_client()
+        self.job = {
+            "id": "canceljob",
+            "type": "search",
+            "status": "running",
+            "error": None,
+            "progress": {"done": 0, "total": 0, "current": ""},
+            "log": [],
+            "result": None,
+            "cancel_requested": False,
+        }
+        web.JOBS[self.job["id"]] = self.job
+        self.addCleanup(web.JOBS.pop, self.job["id"], None)
+
+    def test_job_public_exposes_the_cancel_flag(self):
+        self.assertFalse(web._job_public(self.job)["cancel_requested"])
+        self.job["cancel_requested"] = True
+        self.assertTrue(web._job_public(self.job)["cancel_requested"])
+
+    def test_only_running_jobs_are_active(self):
+        with mock.patch.object(web, "JOBS", {self.job["id"]: self.job}):
+            self.assertIs(web._active_job(), self.job)
+            self.job["status"] = "cancelled"
+            self.assertIsNone(web._active_job())
+
+    def test_unknown_job_gets_404(self):
+        response = self.client.post("/api/job/missing/cancel")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.get_json(), {"error": "unknown job"})
+
+    def test_finished_job_gets_409(self):
+        self.job["status"] = "done"
+        response = self.client.post("/api/job/canceljob/cancel")
+        self.assertEqual(response.status_code, 409)
+        payload = response.get_json()
+        self.assertEqual(payload["error"], "job is not running")
+        self.assertEqual(payload["status"], "done")
+        self.assertFalse(self.job["cancel_requested"])
+
+    def test_running_job_accepts_cancel_and_repeated_requests(self):
+        first = self.client.post("/api/job/canceljob/cancel")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.get_json(), {
+            "cancelled": True,
+            "status": "running",
+            "cancel_requested": True,
+        })
+        self.assertTrue(self.job["cancel_requested"])
+        self.assertIn(
+            "Cancel requested; stopping after the current step.",
+            self.job["log"],
+        )
+
+        second = self.client.post("/api/job/canceljob/cancel")
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.get_json()["cancel_requested"], True)
+        self.assertEqual(self.job["status"], "running")
+        self.assertEqual(
+            self.job["log"].count(
+                "Cancel requested; stopping after the current step."
+            ),
+            1,
+        )
+
+
+class SearchJobCancelTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(web.history, "record")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.search = self.dir / "search_results.xlsx"
+        self.extracted = self.dir / "extracted_data.xlsx"
+        self.closed = self.dir / "closed_source_papers.xlsx"
+        self.checkpoint = self.dir / "checkpoint.json"
+        self.local_index = self.dir / "local_pdfs.json"
+        self._fig_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._fig_tmp.cleanup)
+        patch_figures_paths(self, self._fig_tmp.name)
+        self.figures_dir = Path(self._fig_tmp.name) / "figures"
+        self.figures_index = self.figures_dir / "index.json"
+        self.figures_xlsx = Path(self._fig_tmp.name) / "figures.xlsx"
+
+    def _job(self):
+        return {
+            "log": [],
+            "progress": {"done": 0, "total": 0, "current": ""},
+            "result": None,
+            "status": "running",
+            "error": None,
+            "cancel_requested": False,
+        }
+
+    def _write_previous_dataset(self):
+        self.search.write_bytes(b"previous search workbook")
+        self.extracted.write_bytes(b"previous extracted workbook")
+        self.closed.write_bytes(b"previous closed workbook")
+        self.checkpoint.write_text(
+            json.dumps({"pmid:1": {"status": "extracted", "n": 3}}),
+            encoding="utf-8",
+        )
+        self.local_index.write_text(
+            json.dumps({"pmid:1": {"filename": "old.pdf"}}),
+            encoding="utf-8",
+        )
+        self.figures_dir.mkdir(parents=True, exist_ok=True)
+        self.figures_index.write_text(
+            json.dumps({"version": 1, "figures": [{"id": "old"}]}),
+            encoding="utf-8",
+        )
+        self.figures_xlsx.write_bytes(b"previous figures workbook")
+
+    def _snapshot(self):
+        paths = [
+            self.search, self.extracted, self.closed, self.checkpoint,
+            self.local_index, self.figures_index, self.figures_xlsx,
+        ]
+        return {path: path.read_bytes() for path in paths}
+
+    def _run(self, job, search, scan=None, **kwargs):
+        patches = [
+            mock.patch.object(web.config, "SEARCH_RESULTS_XLSX", self.search),
+            mock.patch.object(web.config, "EXTRACTED_XLSX", self.extracted),
+            mock.patch.object(web.config, "CLOSED_SOURCE_XLSX", self.closed),
+            mock.patch.object(web.config, "CHECKPOINT_JSON", self.checkpoint),
+            mock.patch.object(
+                web.config, "LOCAL_PDF_INDEX_JSON", self.local_index
+            ),
+            mock.patch.object(web, "apply_settings", lambda s: None),
+            mock.patch.object(web, "load_settings", lambda: {}),
+            mock.patch.object(web.searchers, "search", search),
+        ]
+        if scan is not None:
+            patches.append(mock.patch.object(web.local_pdfs, "scan_folder", scan))
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            web._run_search_job(job, "A", ["pubmed"], 10, **kwargs)
+
+    def test_cancel_before_search_keeps_the_previous_dataset(self):
+        self._write_previous_dataset()
+        before = self._snapshot()
+        job = self._job()
+        job["cancel_requested"] = True
+        search = mock.Mock(side_effect=AssertionError("search must not start"))
+
+        self._run(job, search)
+
+        self.assertEqual(job["status"], "cancelled")
+        self.assertIsNone(job["error"])
+        self.assertEqual(job["result"], {"cancelled": True})
+        self.assertIn(
+            "Search cancelled; previous results were kept.",
+            "\n".join(job["log"]),
+        )
+        search.assert_not_called()
+        self.assertEqual(self._snapshot(), before)
+
+    def test_cancel_during_local_scan_takes_effect_after_the_scan(self):
+        self._write_previous_dataset()
+        before = self._snapshot()
+        job = self._job()
+        search = mock.Mock(side_effect=AssertionError("search must not start"))
+
+        def fake_scan(folder, recursive=False):
+            job["cancel_requested"] = True
+            return [], {
+                "scanned": 0, "copied": 0, "linked": 0, "duplicates": 0,
+                "errors": 0, "error_details": [],
+            }
+
+        self._run(
+            job, search, scan=fake_scan,
+            local_folder=str(self.dir), local_recursive=False,
+        )
+
+        self.assertEqual(job["status"], "cancelled")
+        search.assert_not_called()
+        self.assertEqual(self._snapshot(), before)
+
+    def test_cancel_after_online_search_does_not_replace_outputs(self):
+        self._write_previous_dataset()
+        before = self._snapshot()
+        job = self._job()
+
+        def fake_search(query, sources, limit=None, year_from=None, year_to=None,
+                        cancel_check=None):
+            self.assertTrue(callable(cancel_check))
+            job["cancel_requested"] = True
+            return [{"sources": ["pubmed"], "title": "New", "doi": "10.1/new"}]
+
+        self._run(job, fake_search)
+
+        self.assertEqual(job["status"], "cancelled")
+        self.assertIn(
+            "Search cancelled; previous results were kept.",
+            "\n".join(job["log"]),
+        )
+        self.assertEqual(self._snapshot(), before)
+
+    def test_search_cancelled_exception_marks_cancelled_not_error(self):
+        self._write_previous_dataset()
+        before = self._snapshot()
+        job = self._job()
+
+        def fake_search(*args, **kwargs):
+            job["cancel_requested"] = True
+            raise web.searchers.SearchCancelled()
+
+        self._run(job, fake_search)
+
+        self.assertEqual(job["status"], "cancelled")
+        self.assertIsNone(job["error"])
+        self.assertIn(
+            "Search cancelled; previous results were kept.",
+            "\n".join(job["log"]),
+        )
+        self.assertEqual(self._snapshot(), before)
+
+
+class ExtractJobCancelTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(web.history, "record")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_cancel_after_first_paper_keeps_completed_rows_and_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            extracted = tmp / "extracted_data.xlsx"
+            closed = tmp / "closed.xlsx"
+            checkpoint = tmp / "checkpoint.json"
+            papers = [
+                {"title": "Paper One", "doi": "10.1/one", "pmid": "555",
+                 "sources": ["pubmed"]},
+                {"title": "Paper Two", "doi": "10.1/two", "pmid": "666",
+                 "sources": ["pubmed"]},
+            ]
+            job = {
+                "log": [],
+                "progress": {"done": 0, "total": 0, "current": ""},
+                "result": None,
+                "status": "running",
+                "error": None,
+                "cancel_requested": False,
+            }
+
+            def fake_extract(text, fields=None, instruction=None):
+                job["cancel_requested"] = True
+                return [{"mutation": "M2"}]
+
+            prepare = mock.Mock(side_effect=lambda p: (
+                "full text", "test",
+                {"path": None, "filename": "", "label": "none", "reason": "no PDF"},
+            ))
+            with mock.patch.object(web.config, "EXTRACTED_XLSX", extracted), \
+                 mock.patch.object(web.config, "CLOSED_SOURCE_XLSX", closed), \
+                 mock.patch.object(web.config, "CHECKPOINT_JSON", checkpoint), \
+                 mock.patch.object(web.config, "PDF_ARCHIVE_ENABLED", False), \
+                 mock.patch.object(web, "apply_settings", lambda s: None), \
+                 mock.patch.object(web, "load_settings", lambda: {}), \
+                 mock.patch.object(
+                     web, "_load_search_results", lambda required=False: papers
+                 ), \
+                 mock.patch.object(web, "_prepare_paper", prepare), \
+                 mock.patch.object(web.extractor, "extract", fake_extract):
+                web._run_extract_job(
+                    job, "Extract mutations", ["mutation"], mode="records"
+                )
+
+            self.assertEqual(job["status"], "cancelled")
+            self.assertIsNone(job["error"])
+            self.assertEqual(job["progress"]["done"], 1)
+            self.assertEqual(job["progress"]["total"], 2)
+            self.assertEqual(job["progress"]["current"], "")
+            self.assertEqual(job["result"]["papers_processed"], 1)
+            self.assertEqual(job["result"]["extracted"], 1)
+            self.assertTrue(job["result"]["cancelled"])
+            self.assertIn(
+                "Extraction cancelled after 1 paper(s); completed rows were kept.",
+                "\n".join(job["log"]),
+            )
+            self.assertEqual(prepare.call_count, 1)
+
+            table = read_sheet(extracted)
+            self.assertEqual(len(table), 2)
+            row = dict(zip(table[0], table[1]))
+            self.assertEqual(row["mutation"], "M2")
+            self.assertEqual(row["paper_key"], "pmid:555")
+
+            state = json.loads(checkpoint.read_text(encoding="utf-8"))
+            self.assertEqual(state["pmid:555"]["status"], "extracted")
+            self.assertNotIn("pmid:666", state)
+
+
 class DataTabViewerMarkupTests(unittest.TestCase):
     def test_viewer_markup_and_api_plumbing_exist(self):
         root = Path(__file__).resolve().parent.parent
@@ -1323,6 +1628,12 @@ class DataTabViewerMarkupTests(unittest.TestCase):
         self.assertIn("data.figures", script)
         self.assertIn("/api/figure/", script)
         self.assertIn("figures.xlsx", template)
+        self.assertIn('id="cancel-job"', template)
+        self.assertIn('aria-label="Cancel the running job"', template)
+        self.assertIn("cancelJob", script)
+        self.assertIn("/cancel", script)
+        self.assertIn("Cancelling…", script)
+        self.assertIn("Job cancelled.", script)
 
 
 if __name__ == "__main__":

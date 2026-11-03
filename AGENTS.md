@@ -66,7 +66,10 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   automatically. `normalize_year_range()` is the shared validator: it returns
   4-digit strings or `None` for open ends and rejects bools, non-4-digit values
   and `from > to` with `ValueError`. Dedup key is
-  PMID > lowercased DOI > lowercased title (`paper_key`).
+  PMID > lowercased DOI > lowercased title (`paper_key`). `search()` and
+  `search_all()` accept an optional `cancel_check` callable and raise
+  `SearchCancelled` between sources/queries; in-flight HTTP requests always
+  finish. Omitting `cancel_check` keeps the old behaviour.
 - `fetcher.py`: full text via PMC XML → source-provided OA URL → Unpaywall;
   rejects bodies under 500 chars.
 - `pdf_fetcher.py`: archiving runs only during Extract, not Search. Article PDF
@@ -106,6 +109,10 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
 - `app.py`: thin Flask layer that imports `_prepare_paper`, `_load_search_results`,
   etc. from `main.py`, so engine changes affect both interfaces. Jobs are
   in-memory and one-at-a-time; do not enable Flask's reloader or multiple workers.
+  Job statuses are `running`, `done`, `error` and `cancelled`; `_active_job()`
+  treats only `running` as active. `POST /api/job/<id>/cancel` sets the job's
+  `cancel_requested` flag under `JOB_LOCK` (404 unknown, 409 non-running) and the
+  job body stops at its next cooperative check.
   `GET /api/annotated-pdf/<path:paper_key>` serves only keys in
   `output/pdf_index.json`, regenerating a missing annotation or falling back to
   the original PDF; unknown/invalid keys are 404. `GET /api/results` keeps
@@ -125,6 +132,10 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   as paper-grouped lazy thumbnails (`/api/figure/<id>`) with a no-dependency
   lightbox (backdrop/Escape/close, label, page, caption, new-tab link); the
   section and `figures.xlsx` buttons are hidden when the list is empty.
+  `#progress-card` also hosts the `#cancel-job` button: it is visible only while
+  a job is `running`, posts to the cancel endpoint, disables itself and shows
+  `Cancelling…` when `cancel_requested` is true, and is reset/hidden for
+  `done`, `error` and `cancelled`.
 
 ## Behavior that is easy to break
 
@@ -137,6 +148,21 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   run that scans `--local-folder` writes the final merged set so retained papers
   keep their mappings. The figure index follows it too: web search clears it
   (`figures.clear()`), CLI search preserves it.
+- **Cancellation is cooperative and must preserve partial work:** the web
+  Cancel button sets `cancel_requested`; it never kills a thread. `search()`
+  checks between sources (and `search_all()` between queries) and raises
+  `SearchCancelled`, which `_run_search_job()` maps to status `cancelled`, not
+  `error`. Before writing/replacing anything, the search job checks again, so a
+  cancelled search leaves the previous `search_results.xlsx`, extracted/closed
+  files, checkpoint, local index and figures untouched. `_run_extract_job()`
+  checks before each paper and again after the current one; the in-flight paper
+  finishes and its rows/checkpoint/closed entry are saved, then the loop breaks.
+  Unprocessed papers are never marked done, so a later Extract resumes them.
+  Progress/result are set from the completed count and the log says
+  `Extraction cancelled after N paper(s); completed rows were kept.`. A cancel
+  during a long HTTP/LLM call takes effect only when that call returns. Do not
+  add background workers, per-paper threads, or code that treats `cancelled` as
+  `error`/active.
 - **Local PDFs are a separate source and skip the online PDF path:**
   `_prepare_paper()` uses the archived local file directly, reports
   `source="local"` / `label="local:folder"`, and never calls

@@ -276,6 +276,14 @@ select {
 .progress-bar { height: 100%; width: 0%; background: var(--accent); border-radius: 999px; transition: width 0.4s ease; }
 .progress-bar.indeterminate { width: 40%; animation: slide 1.2s ease-in-out infinite; }
 @keyframes slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+.progress-status-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin: 10px 0 4px;
+}
+.progress-status-row .progress-status { flex: 1 1 auto; min-width: 0; margin: 0; }
+.cancel-btn { flex: none; color: var(--red); border-color: #fecaca; }
+.cancel-btn:hover { background: var(--red-bg); }
+.cancel-btn:disabled { color: #b6c2d4; border-color: var(--line); background: #fff; }
 .progress-status { font-size: 0.9rem; margin: 10px 0 4px; }
 .log {
   background: #0f172a; color: #dbeafe; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;

@@ -231,6 +231,67 @@ class SearchForwardingTests(unittest.TestCase):
             ("Q2", ["pubmed"], 3, "2015", "2020"),
         ])
 
+    def test_search_raises_cancelled_between_sources(self):
+        calls = []
+        state = {"cancel": False}
+
+        def first(query, limit=None, year_from=None, year_to=None):
+            calls.append("first")
+            state["cancel"] = True
+            return [{"sources": ["first"], "title": "One"}]
+
+        def second(query, limit=None, year_from=None, year_to=None):
+            calls.append("second")
+            return [{"sources": ["second"], "title": "Two"}]
+
+        registry = {
+            "first": {"label": "First", "fn": first},
+            "second": {"label": "Second", "fn": second},
+        }
+        with mock.patch.object(searchers, "SOURCE_REGISTRY", registry):
+            with self.assertRaises(searchers.SearchCancelled):
+                searchers.search(
+                    "A", ["first", "second"],
+                    cancel_check=lambda: state["cancel"],
+                )
+
+        self.assertEqual(calls, ["first"])
+
+    def test_search_all_forwards_and_honours_cancel_check(self):
+        calls = []
+        state = {"cancel": False}
+
+        def fake_search(query, sources, limit=None, year_from=None, year_to=None,
+                        cancel_check=None):
+            calls.append((query, cancel_check))
+            state["cancel"] = True
+            return [{"sources": ["fake"], "title": query}]
+
+        def cancel_check():
+            return state["cancel"]
+
+        with mock.patch.object(searchers.config, "QUERIES", ["Q1", "Q2"]), \
+             mock.patch.object(searchers.config, "SOURCES", ["pubmed"]), \
+             mock.patch.object(searchers, "search", fake_search):
+            with self.assertRaises(searchers.SearchCancelled):
+                searchers.search_all(
+                    limit=3, year_from=2015, year_to="2020",
+                    cancel_check=cancel_check,
+                )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "Q1")
+        self.assertIs(calls[0][1], cancel_check)
+
+    def test_search_without_cancel_check_keeps_existing_behavior(self):
+        def one(query, limit=None, year_from=None, year_to=None):
+            return [{"sources": ["one"], "title": "One", "doi": "10.1/X"}]
+
+        registry = {"one": {"label": "One", "fn": one}}
+        with mock.patch.object(searchers, "SOURCE_REGISTRY", registry):
+            papers = searchers.search("A", ["one"])
+        self.assertEqual([p["title"] for p in papers], ["One"])
+
 
 class MainYearRangeTests(unittest.TestCase):
     def _run_search(self, config_from=None, config_to=None, **kwargs):
@@ -328,7 +389,8 @@ class SearchJobYearRangeTests(unittest.TestCase):
     def _run_job(self, keywords, saved_settings=None, **kwargs):
         calls = []
 
-        def fake_search(query, sources, limit=None, year_from=None, year_to=None):
+        def fake_search(query, sources, limit=None, year_from=None, year_to=None,
+                        cancel_check=None):
             calls.append((query, sources, limit, year_from, year_to))
             return [self._paper()]
 

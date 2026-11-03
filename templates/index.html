@@ -148,7 +148,11 @@
     <section id="progress-card" class="card hidden">
       <h2>Working…</h2>
       <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
-      <p id="progress-status" class="progress-status"></p>
+      <div class="progress-status-row">
+        <p id="progress-status" class="progress-status"></p>
+        <button id="cancel-job" class="ghost-btn cancel-btn hidden" type="button"
+                aria-label="Cancel the running job" onclick="cancelJob()" disabled>Cancel job</button>
+      </div>
       <pre id="log" class="log"></pre>
     </section>
 
