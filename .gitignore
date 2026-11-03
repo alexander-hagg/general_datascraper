@@ -3,4 +3,5 @@ __pycache__/
 .venv/
 output/pdfs/
 output/checkpoint.json
+output/local_pdfs.json
 output/*.xlsx

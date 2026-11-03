@@ -92,7 +92,10 @@ def _merge_into(papers, incoming):
         return
 
     existing = papers[key]
-    for f in ("title", "authors", "abstract", "doi", "pmid", "pmcid", "year", "journal"):
+    for f in (
+        "title", "authors", "abstract", "doi", "pmid", "pmcid", "year", "journal",
+        "local_pdf", "local_pdf_path", "local_pdf_original",
+    ):
         if not existing.get(f) and incoming.get(f):
             existing[f] = incoming[f]
 

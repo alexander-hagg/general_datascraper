@@ -252,6 +252,83 @@ range. The year range is pushed into each website's query, so it also affects
 which papers are available to the journal blocklist.
 
 
+## Local PDF folder
+
+The Search card has an optional **Local PDF folder** box and an **Include
+subfolders** checkbox. Use it to work with PDFs you already have on your
+computer:
+
+- **Combine with an online search** — type search terms, pick websites, and
+  choose a folder. Online results and local PDFs are merged into one dataset.
+- **Folder-only** — choose a folder, leave the search terms empty, and deselect
+  every website. ScrapeLite then skips the online search and works only on the
+  PDFs in that folder.
+
+Each usable PDF is copied (or hardlinked when possible) into `output/pdfs/`
+with a deterministic name of the form
+`local_<short-hash>_<original-name>.pdf`. Your original files are never moved or
+changed. Extraction, the PDF columns and future viewing tools all use the
+archived copy, so the `output/` folder stays self-contained. ScrapeLite reads
+the title, author, creation year and DOI from the PDF metadata (plus the first
+three pages for a DOI). If those are missing, it falls back to the filename for
+the title and a four-digit year.
+
+Local PDFs are matched to online results by DOI first, then by normalized title
+(case, punctuation and extra whitespace are ignored), so a local `paper.pdf`
+does not create a duplicate row when the same paper was also found online.
+Unmatched local PDFs become rows with the source `local`. During extraction,
+their rows are marked with `pdf_source = local:folder`.
+
+Things to know:
+
+- **No OCR.** PDFs that only contain scanned images have no extractable text.
+  They are still archived, but extraction cannot read them; they appear in
+  `output/closed_source_papers.xlsx` with the reason
+  `PDF saved but no extractable text`. Run OCR on such files first if needed.
+- PDFs already inside `output/pdfs/` are skipped when scanning, so archived
+  copies are never re-imported.
+- A safety cap of **500 PDFs** applies (`MAX_LOCAL_PDFS` in `config.py`). A
+  larger folder is rejected with a clear error instead of silently processing
+  only the first files.
+- The publication-year range applies to the **online search only**. Local PDFs
+  are never dropped because their year is outside the range.
+- The journal blocklist is applied to the combined online + local result set.
+  Local PDFs usually have no journal name, so they are not excluded by it.
+
+The same workflow is available from the command line:
+
+```
+# Add local PDFs to a normal config.py search
+python main.py --search-only --local-folder "C:\Users\me\Papers" --recursive
+
+# Folder-only: no PubMed/Europe PMC/Crossref search at all
+python main.py --search-only --local-folder "C:\Users\me\Papers" --local-only
+
+# Search + extract in one run
+python main.py --local-folder "C:\Users\me\Papers" --recursive
+```
+
+`--recursive` includes subfolders; without it only the top level is scanned.
+`--local-only` requires `--local-folder`. The CLI still merges new results into
+the existing `search_results.xlsx` (the web app replaces its dataset on every
+search). A later `python main.py --extract-only` does **not** rescan the folder:
+the local PDF mapping is stored in `output/local_pdfs.json`, which is also
+git-ignored.
+
+Defaults can be set in `config.py`:
+
+```python
+LOCAL_PDF_DIR = r"C:\Users\me\Papers"
+LOCAL_PDF_RECURSIVE = False
+MAX_LOCAL_PDFS = 500
+```
+
+The web app saves the folder and the subfolder choice with its other settings
+(`output/web_settings.json`); those values override `config.py` while it runs.
+The folder is only checked when you click **Search papers**, not when you save
+settings, and no public route serves files from your filesystem.
+
+
 ## Search suggestions
 
 Two kinds of help are available while you build the query:
@@ -290,11 +367,13 @@ and neither feature changes the search or extraction pipeline.
 ## PDF archiving & preprint fallback
 
 During the **Extract** step (never during Search), ScrapeLite also downloads and
-archives each paper's PDF into `output/pdfs/`. Filenames are deterministic and
-derived from the paper key: `PMID_123456.pdf` when a PMID exists, otherwise the
-DOI (e.g. `10.1000_example.pdf`), otherwise a sanitized title. Only payloads that
-start with the `%PDF-` magic bytes are written, and every network call is
-timeout-guarded, so a failed download never stops the run.
+archives each online paper's PDF into `output/pdfs/`. Filenames are deterministic
+and derived from the paper key: `PMID_123456.pdf` when a PMID exists, otherwise
+the DOI (e.g. `10.1000_example.pdf`), otherwise a sanitized title. Only payloads
+that start with the `%PDF-` magic bytes are written, and every network call is
+timeout-guarded, so a failed download never stops the run. Local PDFs are copied
+into the same folder during Search (see **Local PDF folder** above); their
+archived names start with `local_`.
 
 The fallback order is:
 
@@ -312,8 +391,8 @@ The fallback order is:
 When a preprint PDF is used, extraction still proceeds (a preprint counts as
 open access) and the output marks it: `extracted_data.xlsx` gains `pdf_file` and
 `pdf_source` columns, where `pdf_source` is e.g. `article:pmc`,
-`preprint:biorxiv`, or `none`. This makes it clear that the data may differ from
-the final published article.
+`preprint:biorxiv`, `local:folder`, or `none`. This makes it clear that the data
+may differ from the final published article.
 
 If extractable full text exists (HTML/XML ≥ 500 characters) but no PDF and no
 preprint can be saved, the data is still extracted **and** the paper is also

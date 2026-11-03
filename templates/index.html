@@ -74,6 +74,17 @@
         </div>
       </div>
 
+      <label class="field-label" for="local-folder">Local PDF folder <span class="muted">(optional)</span></label>
+      <div class="local-folder-row">
+        <input type="text" id="local-folder" placeholder="e.g. C:\Users\me\Papers">
+        <label class="checkbox-inline" for="local-recursive">
+          <input type="checkbox" id="local-recursive"> Include subfolders
+        </label>
+      </div>
+      <p class="hint">Point at a folder of PDFs to extract them without a search (clear the
+        search terms and websites), or combine them with a normal online search. PDFs are
+        copied into <code>output/pdfs/</code>, so the output stays self-contained.</p>
+
       <label class="field-label" for="excluded-journals">Exclude journals <span class="muted">(optional, one per line)</span></label>
       <textarea id="excluded-journals" rows="3" placeholder="e.g. Predatory Journal of Examples&#10;Journal of Questionable Results"></textarea>
       <p class="hint">One journal name per line. Matching is case-insensitive and uses

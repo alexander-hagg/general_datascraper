@@ -27,6 +27,7 @@ import config
 import extractor
 import fetcher
 import filters
+import local_pdfs
 import searchers
 import suggester
 import writer
@@ -77,7 +78,16 @@ def _default_settings():
         ),
         "year_from": year_from,
         "year_to": year_to,
+        "local_folder": str(getattr(config, "LOCAL_PDF_DIR", "") or ""),
+        "local_recursive": bool(getattr(config, "LOCAL_PDF_RECURSIVE", False)),
     }
+
+
+def _as_bool(value):
+    """Accept JSON booleans plus common string/number spellings."""
+    if isinstance(value, str):
+        return value.strip().casefold() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 def load_settings():
@@ -98,6 +108,8 @@ def load_settings():
                 defaults = _default_settings()
                 d["year_from"] = defaults["year_from"]
                 d["year_to"] = defaults["year_to"]
+            d["local_folder"] = str(d.get("local_folder") or "").strip()
+            d["local_recursive"] = _as_bool(d.get("local_recursive"))
             return d
         except Exception:
             return _default_settings()
@@ -119,6 +131,10 @@ def apply_settings(s):
             )
         except ValueError:
             pass  # keep the config values; the search request will report the error
+    if "local_folder" in s:
+        config.LOCAL_PDF_DIR = str(s.get("local_folder") or "")
+    if "local_recursive" in s:
+        config.LOCAL_PDF_RECURSIVE = _as_bool(s.get("local_recursive"))
 
 
 apply_settings(load_settings())
@@ -184,10 +200,12 @@ def _paper_to_row(p):
 
 
 _YEARS_UNSET = object()
+_LOCAL_UNSET = object()
 
 
 def _run_search_job(job, query, sources, max_results, excluded_journals=None,
-                    year_from=_YEARS_UNSET, year_to=_YEARS_UNSET):
+                    year_from=_YEARS_UNSET, year_to=_YEARS_UNSET,
+                    local_folder=_LOCAL_UNSET, local_recursive=_LOCAL_UNSET):
     try:
         settings = load_settings()
         apply_settings(settings)
@@ -210,26 +228,91 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None,
         year_from, year_to = searchers.normalize_year_range(year_from, year_to)
         range_label = searchers.year_range_label(year_from, year_to)
 
+        # Local settings follow the same omitted-vs-explicit rule as the years.
+        if local_folder is _LOCAL_UNSET:
+            local_folder = settings.get("local_folder")
+        if local_recursive is _LOCAL_UNSET:
+            local_recursive = settings.get("local_recursive")
+        local_folder = str(local_folder or "").strip()
+        local_recursive = _as_bool(local_recursive)
+
+        query = str(query or "").strip()
+        sources = [str(s) for s in (sources or []) if str(s).strip()]
+        online = bool(query and sources)
+        if local_folder and bool(query) != bool(sources):
+            raise ValueError(
+                "Choose at least one website, or clear the search terms for a "
+                "folder-only search." if query else
+                "Enter at least one search term, or deselect every website for "
+                "a folder-only search."
+            )
+        if not online and not local_folder:
+            raise ValueError(
+                "Enter a search term and choose at least one website, "
+                "or choose a local PDF folder."
+            )
+
         terms = filters.parse_journal_terms(excluded_journals)
-        job["log"].append(f"Query: {query}")
-        job["log"].append(f"Websites: {', '.join(sources)}")
+        job["log"].append(f"Query: {query or '(none — folder only)'}")
+        job["log"].append(
+            "Websites: " + (", ".join(sources) if sources else "(none)")
+        )
         job["log"].append(f"Publication years: {range_label or 'all years'}")
+        if local_folder:
+            job["log"].append(
+                f"Local PDF folder: {local_folder} "
+                f"({'including subfolders' if local_recursive else 'top-level only'})"
+            )
         if terms:
             job["log"].append("Journal blocklist: " + ", ".join(terms))
-        # A new search starts a fresh dataset: replace the search sheet AND clear
-        # any previous extraction outputs + resume state, so Extract only ever
-        # works on this search's papers.
-        papers = searchers.search(
-            query, sources, limit=max_results,
-            year_from=year_from, year_to=year_to,
-        )
+
+        # Scan inside the job so a large folder reports progress instead of
+        # blocking the request. Invalid folders are also rejected by /api/search.
+        local_papers, local_stats = [], None
+        if local_folder:
+            local_papers, local_stats = local_pdfs.scan_folder(
+                local_folder, recursive=local_recursive
+            )
+            job["log"].append(
+                f"Local PDFs: {local_stats['scanned']} scanned, "
+                f"{len(local_papers)} unique, {local_stats['copied']} copied, "
+                f"{local_stats['linked']} linked, "
+                f"{local_stats['duplicates']} duplicate(s), "
+                f"{local_stats['errors']} error(s)."
+            )
+            for detail in local_stats.get("error_details", [])[:5]:
+                job["log"].append(f"   !! {detail['file']}: {detail['error']}")
+
+        if online:
+            papers = searchers.search(
+                query, sources, limit=max_results,
+                year_from=year_from, year_to=year_to,
+            )
+        else:
+            papers = []
+            job["log"].append("Online search skipped (folder-only).")
+
+        if local_papers:
+            before_local = len(papers)
+            papers = local_pdfs.merge_local_papers(papers, local_papers)
+            local_added = len(papers) - before_local
+            job["log"].append(
+                f"Merged local PDFs: {len(local_papers) - local_added} matched "
+                f"existing paper(s), {local_added} added as new paper(s)."
+            )
+
         papers, excluded = filters.filter_papers(papers, terms)
         rows = [_paper_to_row(p) for p in papers]
+        # A new search starts a fresh dataset: replace the search sheet AND clear
+        # any previous extraction outputs + resume state, so Extract only ever
+        # works on this search's papers. The index is replaced too, so old
+        # local mappings can never point at rows from the previous dataset.
         writer.write_xlsx(config.SEARCH_RESULTS_XLSX, SEARCH_COLS, rows)
         for path in (config.EXTRACTED_XLSX, config.CLOSED_SOURCE_XLSX):
             if Path(path).exists():
                 Path(path).unlink()
         Checkpoint(config.CHECKPOINT_JSON).reset()
+        local_pdfs.write_index(papers, replace=True)
         job["result"] = {
             "papers": rows,
             "added": len(rows),
@@ -238,13 +321,21 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None,
             "year_from": year_from,
             "year_to": year_to,
             "year_range": range_label or "all years",
+            "local_folder": local_folder,
+            "local_recursive": local_recursive,
+            "local_count": len(local_papers),
+            "local_stats": local_stats,
         }
         job["status"] = "done"
         job["log"].append(f"Excluded {len(excluded)} paper(s) by journal blocklist.")
         year_note = f"; years {range_label}" if range_label else ""
+        local_note = (
+            f"; {len(local_papers)} local PDF(s)" if local_folder else ""
+        )
         job["log"].append(
             f"Done: {len(rows)} papers in the sheet "
-            f"({len(excluded)} excluded by journal{year_note}; previous data cleared)."
+            f"({len(excluded)} excluded by journal{year_note}{local_note}; "
+            "previous data cleared)."
         )
     except Exception as e:
         job["status"] = "error"
@@ -509,6 +600,10 @@ def api_settings():
                 )
             except ValueError as e:
                 return jsonify({"error": str(e)}), 400
+        if data.get("local_folder") is not None:
+            s["local_folder"] = str(data["local_folder"]).strip()
+        if data.get("local_recursive") is not None:
+            s["local_recursive"] = _as_bool(data["local_recursive"])
         save_settings(s)
         apply_settings(s)
         return jsonify(s)
@@ -520,12 +615,54 @@ def api_search():
     data = request.get_json(force=True, silent=True) or {}
     query = (data.get("query") or "").strip()
     sources = data.get("sources") or []
+    if isinstance(sources, str):
+        sources = [sources]
+    sources = [str(s).strip() for s in sources if str(s).strip()]
     settings = load_settings()
     max_results = data.get("max_results") or settings.get("max_results") or config.DEFAULT_MAX_RESULTS
-    if not query:
-        return jsonify({"error": "Enter at least one search term."}), 400
-    if not sources:
-        return jsonify({"error": "Choose at least one website."}), 400
+
+    # Local folder: an omitted key falls back to the saved setting, while an
+    # explicitly blank folder disables local PDFs for this search.
+    raw_local = "local_folder" in data or "local_recursive" in data
+    if "local_folder" in data:
+        local_folder = str(data.get("local_folder") or "").strip()
+    else:
+        local_folder = str(settings.get("local_folder") or "").strip()
+    if "local_recursive" in data:
+        local_recursive = _as_bool(data.get("local_recursive"))
+    else:
+        local_recursive = _as_bool(settings.get("local_recursive"))
+    local_only = _as_bool(data.get("local_only"))
+    if local_only and not local_folder:
+        return jsonify({
+            "error": "Choose a local PDF folder for a folder-only search."
+        }), 400
+
+    if local_folder:
+        try:
+            local_pdfs.validate_folder(local_folder)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        if local_only:
+            # An explicit folder-only flag wins over any stale query/source
+            # fields an older client may have left in the form.
+            query, sources = "", []
+        if bool(query) != bool(sources):
+            if query:
+                return jsonify({
+                    "error": "Choose at least one website, or clear the search "
+                             "terms for a folder-only search."
+                }), 400
+            return jsonify({
+                "error": "Enter at least one search term, or deselect every "
+                         "website for a folder-only search."
+            }), 400
+    else:
+        if not query:
+            return jsonify({"error": "Enter at least one search term."}), 400
+        if not sources:
+            return jsonify({"error": "Choose at least one website."}), 400
+
     try:
         max_results = int(max_results)
     except (TypeError, ValueError):
@@ -558,19 +695,22 @@ def api_search():
 
     job, err = _start_job(
         "search", _run_search_job, query, sources, max_results,
-        excluded_journals, year_from, year_to,
+        excluded_journals, year_from, year_to, local_folder, local_recursive,
     )
     if err:
         return jsonify({"error": err}), 409
-    # A search is an implicit save for the blocklist and an explicitly supplied
-    # year range: the user should not have to click "Save settings" for values
-    # they just typed to be used again next time.
-    if raw_journals is not None or raw_years:
+    # A search is an implicit save for the blocklist, an explicitly supplied
+    # year range, and the local folder settings: the user should not have to
+    # click "Save settings" for values they just typed to be used again next time.
+    if raw_journals is not None or raw_years or raw_local:
         if raw_journals is not None:
             settings["excluded_journals"] = excluded_journals
         if raw_years:
             settings["year_from"] = year_from
             settings["year_to"] = year_to
+        if raw_local:
+            settings["local_folder"] = local_folder
+            settings["local_recursive"] = local_recursive
         save_settings(settings)
     return jsonify({"job_id": job["id"]})
 

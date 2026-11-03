@@ -250,7 +250,8 @@ class SearchApiJournalTests(unittest.TestCase):
         self.assertEqual(self.calls[0][0], "search")
         self.assertEqual(
             self.calls[0][2],
-            ("A AND B", ["pubmed"], 5, ["Foo Journal", "Bar Journal"], None, None),
+            ("A AND B", ["pubmed"], 5, ["Foo Journal", "Bar Journal"], None, None,
+             "", False),
         )
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["excluded_journals"], ["Foo Journal", "Bar Journal"])
@@ -267,7 +268,7 @@ class SearchApiJournalTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("A", ["crossref"], 3, ["Saved Journal"], None, None),
+            ("A", ["crossref"], 3, ["Saved Journal"], None, None, "", False),
         )
 
     def test_old_client_without_settings_falls_back_to_config(self):
@@ -280,7 +281,7 @@ class SearchApiJournalTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("A", ["europepmc"], 4, ["Configured Journal"], None, None),
+            ("A", ["europepmc"], 4, ["Configured Journal"], None, None, "", False),
         )
         self.assertFalse(self.settings_path.exists())
 
@@ -288,6 +289,182 @@ class SearchApiJournalTests(unittest.TestCase):
         response = self._post({"query": "", "sources": ["pubmed"]})
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.calls, [])
+
+
+class LocalSearchApiTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.settings_path = self.dir / "web_settings.json"
+        self.folder = self.dir / "pdfs"
+        self.folder.mkdir()
+        self.client = web.app.test_client()
+        self.calls = []
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _fake_start(self, job_type, fn, *args):
+        self.calls.append((job_type, fn, args))
+        return {"id": "job123"}, None
+
+    def _post(self, payload):
+        with mock.patch.object(web, "_start_job", new=self._fake_start), \
+             mock.patch.object(web, "SETTINGS_PATH", self.settings_path), \
+             mock.patch.object(web.config, "EXCLUDED_JOURNALS", []), \
+             mock.patch.object(web.config, "YEAR_FROM", None), \
+             mock.patch.object(web.config, "YEAR_TO", None), \
+             mock.patch.object(web.config, "LOCAL_PDF_DIR", ""), \
+             mock.patch.object(web.config, "LOCAL_PDF_RECURSIVE", False):
+            return self.client.post("/api/search", json=payload)
+
+    def test_folder_only_search_is_allowed(self):
+        response = self._post({
+            "query": "",
+            "sources": [],
+            "local_folder": str(self.folder),
+            "local_recursive": True,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.calls[0][2],
+            ("", [], 50, [], None, None, str(self.folder), True),
+        )
+        saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["local_folder"], str(self.folder))
+        self.assertTrue(saved["local_recursive"])
+
+    def test_explicit_folder_only_flag_ignores_online_fields(self):
+        response = self._post({
+            "query": "A",
+            "sources": ["pubmed"],
+            "local_folder": str(self.folder),
+            "local_only": True,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.calls[0][2],
+            ("", [], 50, [], None, None, str(self.folder), False),
+        )
+
+    def test_folder_only_flag_without_a_folder_gets_400(self):
+        response = self._post({
+            "query": "A",
+            "sources": ["pubmed"],
+            "local_folder": "",
+            "local_only": True,
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("folder-only", response.get_json()["error"])
+        self.assertEqual(self.calls, [])
+
+    def test_invalid_folder_gets_400_before_a_job_starts(self):
+        response = self._post({
+            "query": "",
+            "sources": [],
+            "local_folder": str(self.dir / "missing"),
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("does not exist", response.get_json()["error"])
+        self.assertEqual(self.calls, [])
+
+    def test_folder_with_query_but_no_sources_is_rejected(self):
+        response = self._post({
+            "query": "A",
+            "sources": [],
+            "local_folder": str(self.folder),
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Choose at least one website", response.get_json()["error"])
+        self.assertEqual(self.calls, [])
+
+    def test_folder_with_sources_but_no_query_is_rejected(self):
+        response = self._post({
+            "query": "",
+            "sources": ["pubmed"],
+            "local_folder": str(self.folder),
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Enter at least one search term", response.get_json()["error"])
+        self.assertEqual(self.calls, [])
+
+    def test_without_folder_query_and_sources_are_still_required(self):
+        no_query = self._post({"query": "", "sources": ["pubmed"]})
+        no_sources = self._post({"query": "A", "sources": []})
+        self.assertEqual(no_query.status_code, 400)
+        self.assertIn("search term", no_query.get_json()["error"])
+        self.assertEqual(no_sources.status_code, 400)
+        self.assertIn("website", no_sources.get_json()["error"])
+        self.assertEqual(self.calls, [])
+
+    def test_explicit_blank_folder_clears_the_saved_setting(self):
+        self.settings_path.write_text(
+            json.dumps({"local_folder": str(self.folder), "local_recursive": True}),
+            encoding="utf-8",
+        )
+        response = self._post({
+            "query": "A", "sources": ["pubmed"],
+            "local_folder": "", "local_recursive": False,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.calls[0][2],
+            ("A", ["pubmed"], 50, [], None, None, "", False),
+        )
+        saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["local_folder"], "")
+        self.assertFalse(saved["local_recursive"])
+
+    def test_omitted_folder_falls_back_to_saved_setting(self):
+        self.settings_path.write_text(
+            json.dumps({"local_folder": str(self.folder), "local_recursive": True}),
+            encoding="utf-8",
+        )
+        response = self._post({"query": "A", "sources": ["pubmed"]})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.calls[0][2],
+            ("A", ["pubmed"], 50, [], None, None, str(self.folder), True),
+        )
+
+
+class SettingsApiLocalTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.settings_path = self.dir / "web_settings.json"
+        self.client = web.app.test_client()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _request(self, method, payload=None):
+        with mock.patch.object(web, "SETTINGS_PATH", self.settings_path), \
+             mock.patch.object(web, "apply_settings", lambda s: None):
+            if method == "POST":
+                return self.client.post("/api/settings", json=payload)
+            return self.client.get("/api/settings")
+
+    def test_local_folder_settings_round_trip(self):
+        folder = str(self.dir / "pdfs")
+        response = self._request("POST", {
+            "local_folder": folder,
+            "local_recursive": True,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["local_folder"], folder)
+        self.assertTrue(response.get_json()["local_recursive"])
+
+        fetched = self._request("GET").get_json()
+        self.assertEqual(fetched["local_folder"], folder)
+        self.assertTrue(fetched["local_recursive"])
+
+    def test_missing_local_settings_default_to_config(self):
+        with mock.patch.object(web.config, "LOCAL_PDF_DIR", "/configured/path"), \
+             mock.patch.object(web.config, "LOCAL_PDF_RECURSIVE", True):
+            fetched = self._request("GET").get_json()
+        self.assertEqual(fetched["local_folder"], "/configured/path")
+        self.assertTrue(fetched["local_recursive"])
 
 
 class SettingsApiJournalTests(unittest.TestCase):
@@ -357,6 +534,9 @@ class SearchJobJournalTests(unittest.TestCase):
                  mock.patch.object(web.config, "EXTRACTED_XLSX", tmp / "extracted.xlsx"), \
                  mock.patch.object(web.config, "CLOSED_SOURCE_XLSX", tmp / "closed.xlsx"), \
                  mock.patch.object(web.config, "CHECKPOINT_JSON", tmp / "checkpoint.json"), \
+                 mock.patch.object(
+                     web.config, "LOCAL_PDF_INDEX_JSON", tmp / "local_pdfs.json"
+                 ), \
                  mock.patch.object(web, "apply_settings", lambda s: None), \
                  mock.patch.object(web, "load_settings", lambda: {}), \
                  mock.patch.object(
@@ -395,6 +575,9 @@ class SearchJobJournalTests(unittest.TestCase):
                  mock.patch.object(web.config, "EXTRACTED_XLSX", tmp / "extracted.xlsx"), \
                  mock.patch.object(web.config, "CLOSED_SOURCE_XLSX", tmp / "closed.xlsx"), \
                  mock.patch.object(web.config, "CHECKPOINT_JSON", tmp / "checkpoint.json"), \
+                 mock.patch.object(
+                     web.config, "LOCAL_PDF_INDEX_JSON", tmp / "local_pdfs.json"
+                 ), \
                  mock.patch.object(web, "apply_settings", lambda s: None), \
                  mock.patch.object(
                      web, "load_settings",
@@ -410,6 +593,164 @@ class SearchJobJournalTests(unittest.TestCase):
             self.assertEqual(job["status"], "done")
             self.assertEqual(job["result"]["excluded"], 1)
             self.assertEqual(job["result"]["total"], 0)
+
+
+class SearchJobLocalTests(unittest.TestCase):
+    def _job(self):
+        return {
+            "log": [],
+            "progress": {"done": 0, "total": 0, "current": ""},
+            "result": None,
+            "status": "running",
+            "error": None,
+        }
+
+    def _stats(self, scanned=1):
+        return {
+            "folder": "/papers", "recursive": False, "found": scanned,
+            "scanned": scanned, "copied": scanned, "linked": 0, "skipped": 0,
+            "duplicates": 0, "errors": 0, "error_details": [], "papers": scanned,
+        }
+
+    def _local_paper(self, folder, filename="local_x.pdf"):
+        path = folder / filename
+        path.write_bytes(b"%PDF-1.4\nlocal test\n")
+        return {
+            "paper_key": "doi:10.1/local",
+            "sources": ["local"],
+            "title": "Local Paper",
+            "doi": "10.1/local",
+            "authors": "Local Author",
+            "year": "2020",
+            "journal": "",
+            "is_oa": True,
+            "local_pdf": filename,
+            "local_pdf_path": str(path),
+            "local_pdf_original": "/source/paper.pdf",
+        }
+
+    def test_folder_only_job_merges_local_papers_and_writes_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            pdf_dir = tmp / "pdfs"
+            pdf_dir.mkdir()
+            local = self._local_paper(pdf_dir)
+            job = self._job()
+
+            with mock.patch.object(web.config, "SEARCH_RESULTS_XLSX", tmp / "search.xlsx"), \
+                 mock.patch.object(web.config, "EXTRACTED_XLSX", tmp / "extracted.xlsx"), \
+                 mock.patch.object(web.config, "CLOSED_SOURCE_XLSX", tmp / "closed.xlsx"), \
+                 mock.patch.object(web.config, "CHECKPOINT_JSON", tmp / "checkpoint.json"), \
+                 mock.patch.object(web.config, "PDF_DIR", pdf_dir), \
+                 mock.patch.object(
+                     web.config, "LOCAL_PDF_INDEX_JSON", tmp / "local_pdfs.json"
+                 ), \
+                 mock.patch.object(web, "apply_settings", lambda s: None), \
+                 mock.patch.object(web, "load_settings", lambda: {}), \
+                 mock.patch.object(
+                     web.local_pdfs, "scan_folder",
+                     lambda folder, recursive=False: ([local], self._stats()),
+                 ), \
+                 mock.patch.object(
+                     web.searchers, "search",
+                     side_effect=AssertionError("online search must be skipped"),
+                 ):
+                web._run_search_job(
+                    job, "", [], 10, [], None, None, str(tmp), False
+                )
+
+            self.assertEqual(job["status"], "done")
+            self.assertEqual(job["result"]["total"], 1)
+            self.assertEqual(job["result"]["local_count"], 1)
+            self.assertEqual(job["result"]["local_folder"], str(tmp))
+            self.assertIn("folder-only", "\n".join(job["log"]))
+
+            rows = read_sheet(tmp / "search.xlsx")
+            self.assertEqual(dict(zip(rows[0], rows[1]))["title"], "Local Paper")
+            index = json.loads(
+                (tmp / "local_pdfs.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("doi:10.1/local", index)
+
+    def test_online_and_local_results_are_merged_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            pdf_dir = tmp / "pdfs"
+            pdf_dir.mkdir()
+            online = {
+                "paper_key": "doi:10.1/local",
+                "sources": ["pubmed"],
+                "title": "Local Paper",
+                "doi": "10.1/LOCAL",
+                "pmid": "",
+                "year": "2020",
+                "journal": "Journal",
+                "authors": "",
+            }
+            local = self._local_paper(pdf_dir)
+            job = self._job()
+
+            with mock.patch.object(web.config, "SEARCH_RESULTS_XLSX", tmp / "search.xlsx"), \
+                 mock.patch.object(web.config, "EXTRACTED_XLSX", tmp / "extracted.xlsx"), \
+                 mock.patch.object(web.config, "CLOSED_SOURCE_XLSX", tmp / "closed.xlsx"), \
+                 mock.patch.object(web.config, "CHECKPOINT_JSON", tmp / "checkpoint.json"), \
+                 mock.patch.object(web.config, "PDF_DIR", pdf_dir), \
+                 mock.patch.object(
+                     web.config, "LOCAL_PDF_INDEX_JSON", tmp / "local_pdfs.json"
+                 ), \
+                 mock.patch.object(web, "apply_settings", lambda s: None), \
+                 mock.patch.object(web, "load_settings", lambda: {}), \
+                 mock.patch.object(
+                     web.local_pdfs, "scan_folder",
+                     lambda folder, recursive=False: ([local], self._stats()),
+                 ), \
+                 mock.patch.object(
+                     web.searchers, "search",
+                     lambda query, sources, limit=None, year_from=None, year_to=None:
+                         [dict(online)],
+                 ):
+                web._run_search_job(
+                    job, "A", ["pubmed"], 10, [], None, None, str(tmp), False
+                )
+
+            self.assertEqual(job["status"], "done")
+            self.assertEqual(job["result"]["total"], 1)
+            rows = read_sheet(tmp / "search.xlsx")
+            row = dict(zip(rows[0], rows[1]))
+            self.assertEqual(row["title"], "Local Paper")
+            self.assertIn("local", row["source"])
+            index = json.loads(
+                (tmp / "local_pdfs.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("doi:10.1/local", index)
+
+    def test_search_job_replaces_stale_index_even_without_local_pdfs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            index_path = tmp / "local_pdfs.json"
+            index_path.write_text(
+                json.dumps({"doi:10.1/old": {"filename": "old.pdf"}}),
+                encoding="utf-8",
+            )
+            job = self._job()
+
+            with mock.patch.object(web.config, "SEARCH_RESULTS_XLSX", tmp / "search.xlsx"), \
+                 mock.patch.object(web.config, "EXTRACTED_XLSX", tmp / "extracted.xlsx"), \
+                 mock.patch.object(web.config, "CLOSED_SOURCE_XLSX", tmp / "closed.xlsx"), \
+                 mock.patch.object(web.config, "CHECKPOINT_JSON", tmp / "checkpoint.json"), \
+                 mock.patch.object(web.config, "LOCAL_PDF_INDEX_JSON", index_path), \
+                 mock.patch.object(web, "apply_settings", lambda s: None), \
+                 mock.patch.object(web, "load_settings", lambda: {}), \
+                 mock.patch.object(
+                     web.searchers, "search",
+                     lambda query, sources, limit=None, year_from=None, year_to=None: [],
+                 ):
+                web._run_search_job(job, "A", ["pubmed"], 10, [], None, None, "", False)
+
+            self.assertEqual(job["status"], "done")
+            self.assertEqual(
+                json.loads(index_path.read_text(encoding="utf-8")), {}
+            )
 
 
 if __name__ == "__main__":

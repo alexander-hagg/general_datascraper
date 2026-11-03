@@ -334,6 +334,9 @@ class SearchJobYearRangeTests(unittest.TestCase):
                  mock.patch.object(web.config, "EXTRACTED_XLSX", tmp / "extracted.xlsx"), \
                  mock.patch.object(web.config, "CLOSED_SOURCE_XLSX", tmp / "closed.xlsx"), \
                  mock.patch.object(web.config, "CHECKPOINT_JSON", tmp / "checkpoint.json"), \
+                 mock.patch.object(
+                     web.config, "LOCAL_PDF_INDEX_JSON", tmp / "local_pdfs.json"
+                 ), \
                  mock.patch.object(web, "apply_settings", lambda s: None), \
                  mock.patch.object(
                      web, "load_settings",
@@ -444,7 +447,7 @@ class SearchApiYearRangeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("A AND B", ["pubmed"], 5, [], "2015", "2020"),
+            ("A AND B", ["pubmed"], 5, [], "2015", "2020", "", False),
         )
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["year_from"], "2015")
@@ -461,7 +464,7 @@ class SearchApiYearRangeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("A", ["crossref"], 3, [], "2015", "2020"),
+            ("A", ["crossref"], 3, [], "2015", "2020", "", False),
         )
 
     def test_explicit_blank_clears_the_saved_range(self):
@@ -475,7 +478,7 @@ class SearchApiYearRangeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("A", ["crossref"], 50, [], None, None),
+            ("A", ["crossref"], 50, [], None, None, "", False),
         )
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
         self.assertIsNone(saved["year_from"])

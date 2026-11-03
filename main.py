@@ -7,6 +7,7 @@ main.py — run the whole pipeline, or just one stage.
     python main.py --limit 5       extract at most 5 papers (quick demo)
     python main.py --mode table    one output row per row of a results table
     python main.py --year-from 2015 --year-to 2024   limit publication years
+    python main.py --local-folder PATH [--recursive] [--local-only]
     python main.py --reset         clear the resume checkpoint, then run
 
 See README.md for the full picture.
@@ -27,6 +28,7 @@ import config
 import extractor
 import fetcher
 import filters
+import local_pdfs
 import pdf_fetcher
 import searchers
 import writer
@@ -240,7 +242,8 @@ def build_extract_rows(paper, records, field_names, pdf_file="", pdf_source="non
     return rows
 
 
-def run_search(year_from=None, year_to=None):
+def run_search(year_from=None, year_to=None, local_folder=None, recursive=False,
+               local_only=False):
     # Omitted CLI/API values fall back to config.py. An explicit blank string
     # ("") still means "no limit on this side" and overrides a configured year.
     if year_from is None:
@@ -250,10 +253,38 @@ def run_search(year_from=None, year_to=None):
     year_from, year_to = searchers.normalize_year_range(year_from, year_to)
     range_label = searchers.year_range_label(year_from, year_to)
 
+    local_folder = str(local_folder or "").strip()
+    if local_only and not local_folder:
+        raise ValueError("--local-only requires --local-folder PATH.")
+
     print("== Step 1/2: searching ==")
     if range_label:
         print(f"Publication years: {range_label}")
-    new_papers = searchers.search_all(year_from=year_from, year_to=year_to)
+
+    # Scan before the online search so an invalid folder fails fast, without
+    # spending time on network requests.
+    local_papers, local_stats = [], None
+    if local_folder:
+        print(
+            f"Local PDF folder: {local_folder} "
+            f"({'including subfolders' if recursive else 'top-level only'})"
+        )
+        local_papers, local_stats = local_pdfs.scan_folder(
+            local_folder, recursive=recursive
+        )
+        print(
+            f"Local PDFs: {local_stats['scanned']} scanned, {len(local_papers)} "
+            f"unique, {local_stats['copied']} copied, {local_stats['linked']} linked, "
+            f"{local_stats['duplicates']} duplicate(s), {local_stats['errors']} error(s)."
+        )
+        for detail in local_stats.get("error_details", [])[:5]:
+            print(f"  !! {detail['file']}: {detail['error']}")
+
+    if local_only:
+        print("Skipping the online search (--local-only).")
+        new_papers = []
+    else:
+        new_papers = searchers.search_all(year_from=year_from, year_to=year_to)
 
     # Load any papers already in search_results.xlsx so a fresh search ADDS
     # to them (deduped) instead of wiping previous rows. If you want a totally
@@ -263,6 +294,15 @@ def run_search(year_from=None, year_to=None):
     papers = searchers.merge_papers(existing, new_papers)
     added = len(papers) - len(existing)
 
+    if local_papers:
+        before_local = len(papers)
+        papers = local_pdfs.merge_local_papers(papers, local_papers)
+        local_added = len(papers) - before_local
+        print(
+            f"Merged local PDFs: {len(local_papers) - local_added} matched existing "
+            f"paper(s), {local_added} added as new paper(s)."
+        )
+
     # Journal blocklist is applied to the MERGED set, not inside each source
     # client, so rows already in search_results.xlsx are also removed when they
     # start matching a newly-added journal name.
@@ -271,6 +311,11 @@ def run_search(year_from=None, year_to=None):
 
     rows = [paper_to_row(p) for p in papers]
     writer.write_xlsx(config.SEARCH_RESULTS_XLSX, SEARCH_COLS, rows)
+    if local_folder:
+        # The CLI merged with the existing sheet, so this final set also retains
+        # old local mappings. Replacing drops entries for papers that were
+        # removed (for example by the journal blocklist).
+        local_pdfs.write_index(papers, replace=True)
     print(f"Wrote {len(rows)} papers ({added} new) to {config.SEARCH_RESULTS_XLSX}")
     print(f"Excluded {len(excluded)} paper(s) by journal blocklist.")
     return papers
@@ -283,7 +328,7 @@ def _load_search_results(required=True):
                 f"No {config.SEARCH_RESULTS_XLSX.name} yet. Run `python main.py --search-only` "
                 "first (or run `python main.py` to do everything)."
             )
-        return []
+        return local_pdfs.attach_to_papers([])
     wb = load_workbook(config.SEARCH_RESULTS_XLSX, read_only=True)
     ws = wb.active
     headers = [
@@ -311,7 +356,10 @@ def _load_search_results(required=True):
         paper["paper_key"] = paper_identity({"paper_key": d.get("paper_key"), **paper})
         papers.append(paper)
     wb.close()
-    return papers
+    # The workbook only stores search metadata. Re-attach archived local PDFs
+    # from output/local_pdfs.json so a later Extract run does not have to rescan
+    # the source folder (and can run with --extract-only).
+    return local_pdfs.attach_to_papers(papers)
 
 
 def _prepare_paper(p):
@@ -319,7 +367,28 @@ def _prepare_paper(p):
 
     Returns (text, text_source, pdf). If full-text fetching failed but a PDF was
     saved, the PDF's own text is used so extraction can still proceed.
+
+    A paper with an attached local PDF never touches the network: its archived
+    copy is the only PDF considered. When the indexed file is missing, the
+    normal online path runs instead.
     """
+    local_path = local_pdfs.existing_local_path(p)
+    if local_path is not None:
+        pdf = {
+            "path": local_path,
+            "filename": local_path.name,
+            "source": "local",
+            "server": "folder",
+            "label": "local:folder",
+            "reason": "",
+        }
+        local_text = pdf_fetcher.pdf_text(local_path)
+        if local_text and len(local_text.strip()) >= fetcher.MIN_TEXT_CHARS:
+            return local_text, "pdf:local", pdf
+        # No extractable text: do not silently try another PDF. The normal
+        # closed-source flow records PDF_NO_TEXT_REASON for this saved file.
+        return None, "local PDF has no extractable text", pdf
+
     text, source = fetcher.fetch_full_text(p)
     pdf = pdf_fetcher.acquire_pdf(p)
     if not text and pdf.get("path"):
@@ -466,7 +535,26 @@ def parse_args(argv=None):
         default=getattr(config, "EXTRACTION_MODE", "records"),
         help="extraction mode: individual records (default) or table rows",
     )
-    return ap.parse_args(argv)
+    ap.add_argument(
+        "--local-folder",
+        default=None,
+        metavar="PATH",
+        help="also use PDFs from this local folder (copied into output/pdfs/)",
+    )
+    ap.add_argument(
+        "--recursive",
+        action="store_true",
+        help="include subfolders when scanning --local-folder",
+    )
+    ap.add_argument(
+        "--local-only",
+        action="store_true",
+        help="skip the online search and use only --local-folder PDFs",
+    )
+    args = ap.parse_args(argv)
+    if args.local_only and not args.local_folder:
+        ap.error("--local-only requires --local-folder PATH")
+    return args
 
 
 def main():
@@ -480,7 +568,13 @@ def main():
         return
 
     try:
-        papers = run_search(year_from=args.year_from, year_to=args.year_to)
+        papers = run_search(
+            year_from=args.year_from,
+            year_to=args.year_to,
+            local_folder=args.local_folder,
+            recursive=args.recursive,
+            local_only=args.local_only,
+        )
     except ValueError as e:
         sys.exit(f"Error: {e}")
 
