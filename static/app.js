@@ -698,7 +698,9 @@ function syncSelectionUI() {
   document.querySelectorAll("#term-list .node-select").forEach(cb => {
     const node = cb.__node;
     if (!node) return;
-    cb.checked = selectedIds.has(node.id);
+    // A group in the "members selected" state keeps its own box checked so the
+    // control reflects that the group as a whole is active.
+    cb.checked = selectedIds.has(node.id) || childrenSelectedGroups.has(node.id);
   });
   document.querySelectorAll("#term-list .term-row").forEach(row => {
     const node = row.__node;
@@ -738,14 +740,22 @@ function makeSelectCheckbox(node) {
   cb.type = "checkbox";
   cb.className = "node-select";
   cb.title = "Select for grouping";
-  cb.checked = selectedIds.has(node.id);
+  cb.checked = selectedIds.has(node.id) || childrenSelectedGroups.has(node.id);
   cb.__node = node;
   cb.onchange = () => {
     if (cb.checked) {
       selectedIds.add(node.id);
       childrenSelectedGroups.delete(node.id);
     } else {
+      // If this group was showing its members as selected, unchecking the box
+      // clears that whole selection. Unchecking a plain group selection must
+      // not touch any independent child selections.
+      const wasMembersSelected = childrenSelectedGroups.has(node.id);
       selectedIds.delete(node.id);
+      childrenSelectedGroups.delete(node.id);
+      if (wasMembersSelected) {
+        collectDescendants(node).forEach(n => selectedIds.delete(n.id));
+      }
     }
     syncSelectionUI();
   };
