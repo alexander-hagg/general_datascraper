@@ -183,10 +183,12 @@ def ensure_columns(path, columns, defaults=None):
         return False
     wb = load_workbook(path)
     ws = wb.active
-    added = _append_columns(ws, columns, defaults)
+    _header, added = _append_columns(ws, columns, defaults)
+    if not added:
+        wb.close()
+        return True
     _style_header(ws)
-    if added:
-        _hyperlink_doi(ws)
+    _hyperlink_doi(ws)
     wb.save(path)
     return True
 
