@@ -21,6 +21,33 @@
   <main>
     <div id="banner" class="banner hidden"></div>
 
+    <!-- 0. Run folders -->
+    <section id="runs-card" class="card hidden" aria-labelledby="runs-heading">
+      <h2 id="runs-heading">Runs</h2>
+      <p class="hint">Every new Search gets its own run folder, including its search
+        results, extracted data, checkpoint, PDFs and figures. Loading a saved run
+        switches the app back to that folder; nothing runs until you click a button.</p>
+      <div id="run-current" class="run-current"></div>
+      <div class="history-row">
+        <label class="field-label history-label" for="run-select">Saved runs</label>
+        <select id="run-select" class="history-select" disabled>
+          <option value="">No saved runs yet</option>
+        </select>
+      </div>
+      <div class="run-actions">
+        <button class="ghost-btn" id="run-load" type="button"
+                onclick="loadSelectedRun()" disabled>Load run</button>
+        <button class="ghost-btn" id="run-refresh" type="button"
+                onclick="refreshActiveRun()" title="Search again and merge new papers into this run"
+                disabled>Refresh search</button>
+        <button class="ghost-btn danger" id="run-delete" type="button"
+                onclick="deleteSelectedRun()" disabled>Delete run</button>
+      </div>
+      <p class="hint run-hint">Load an old run, then use <strong>Refresh search</strong> to merge
+        new results into it. A normal Search always starts a new run. The active run cannot
+        be deleted until you load another one.</p>
+    </section>
+
     <!-- 1. Search -->
     <section class="card">
       <h2><span class="step">1</span> Search for papers</h2>
@@ -101,6 +128,9 @@
         caught too. It is applied after the search, to the combined results from every
         website; papers with no journal name are never excluded.</p>
 
+      <p class="hint run-search-hint" id="run-search-hint">A normal <strong>Search</strong> creates a new run folder and
+        replaces that folder's dataset. To add new results to an existing run, load it in
+        <strong>Runs</strong> above and click <strong>Refresh search</strong>.</p>
       <button class="primary-btn" id="search-btn" onclick="doSearch()">Search papers</button>
     </section>
 

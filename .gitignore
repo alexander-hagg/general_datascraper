@@ -8,4 +8,6 @@ output/prompt_history.json
 output/pdf_index.json
 output/annotated_pdfs/
 output/figures/
+output/runs/
+output/active_run.json
 output/*.xlsx

@@ -180,6 +180,22 @@ LOCAL_PDF_INDEX_JSON = OUTPUT_DIR / "local_pdfs.json"
 PDF_INDEX_JSON      = OUTPUT_DIR / "pdf_index.json"
 ANNOTATED_PDF_DIR   = OUTPUT_DIR / "annotated_pdfs"
 
+# ==================== 4b. RUN FOLDERS (web app) ====================
+
+# A run is one search dataset: its search sheet, extraction outputs, checkpoint,
+# PDFs, annotations, figures and a state.json live together in
+# output/runs/<run-id>/. The web app enables this at startup
+# (`python app.py` / start scripts); the CLI and unit tests keep using the
+# legacy global files above unless RUNS_ENABLED is turned on explicitly.
+#
+# output/active_run.json remembers the loaded run. It is a small marker, not a
+# dataset; deleting it only means "pick the newest run or import the legacy
+# output/ files". Web settings and prompt history stay global on purpose.
+RUNS_ENABLED = False
+RUNS_DIR = OUTPUT_DIR / "runs"
+ACTIVE_RUN_JSON = OUTPUT_DIR / "active_run.json"
+ACTIVE_RUN_DIR = None  # runtime only: set by runs.apply_run_paths()
+
 # Prompt history for the web app (searches, extraction goals and columns).
 # It is global across workspaces/browser sessions and git-ignored. Old entries
 # are dropped automatically: at most PROMPT_HISTORY_MAX_ENTRIES in total and

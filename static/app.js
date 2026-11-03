@@ -36,7 +36,14 @@ function setBanner(msg, type) {
 function setBusy(running) {
   document.getElementById("search-btn").disabled = running;
   document.getElementById("extract-btn").disabled = running;
-  if (!running) resetCancelButton();
+  ["run-load", "run-refresh", "run-delete"].forEach(id => {
+    const btn = document.getElementById(id);
+    if (btn) btn.disabled = running;
+  });
+  if (!running) {
+    resetCancelButton();
+    updateRunButtons();
+  }
 }
 
 function resetCancelButton() {
@@ -325,6 +332,254 @@ function bindHistoryClear(kind) {
   if (btn) btn.onclick = () => clearPromptHistory(kind);
 }
 
+/* ---------- run folders (savable/loadable application state) ---------- */
+
+const runsState = { enabled: false, active: null, runs: [] };
+
+function runTimestamp(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return text
+    .replace("T", " ")
+    .replace("Z", "")
+    .replace(/\.\d+.*$/, "")
+    .slice(0, 16);
+}
+
+function runCountsLabel(counts) {
+  const c = counts || {};
+  const parts = [];
+  const n = key => Number(c[key]) || 0;
+  if (n("papers")) parts.push(n("papers") + " paper" + (n("papers") === 1 ? "" : "s"));
+  if (n("extracted")) parts.push(n("extracted") + " row" + (n("extracted") === 1 ? "" : "s"));
+  if (n("closed")) parts.push(n("closed") + " closed");
+  if (n("figures")) parts.push(n("figures") + " figure" + (n("figures") === 1 ? "" : "s"));
+  return parts.join(" · ");
+}
+
+function runOptionLabel(run) {
+  const bits = [String(run.name || run.id || "Run")];
+  const date = runTimestamp(run.updated_at || run.created_at);
+  if (date) bits.push(date);
+  const query = truncateHistoryText(
+    String(run.rendered_query || run.query || "").replace(/\s+/g, " ").trim(),
+    70
+  );
+  if (query) bits.push(query);
+  const counts = runCountsLabel(run.counts);
+  if (counts) bits.push(counts);
+  return bits.join(" — ");
+}
+
+function updateRunButtons() {
+  const select = document.getElementById("run-select");
+  const selected = select ? select.value : "";
+  const busy = !!currentJobId;
+  const activeId = runsState.active ? runsState.active.id : "";
+  const load = document.getElementById("run-load");
+  const refresh = document.getElementById("run-refresh");
+  const remove = document.getElementById("run-delete");
+  if (load) load.disabled = busy || !selected;
+  if (refresh) refresh.disabled = busy || !runsState.active;
+  if (remove) remove.disabled = busy || !selected || selected === activeId;
+}
+
+function renderRuns() {
+  const current = document.getElementById("run-current");
+  if (current) {
+    current.innerHTML = "";
+    if (runsState.active) {
+      current.appendChild(makeEl(
+        "span",
+        "run-current-name",
+        runsState.active.name || runsState.active.id
+      ));
+      const meta = [
+        runTimestamp(runsState.active.updated_at || runsState.active.created_at),
+        runCountsLabel(runsState.active.counts),
+      ].filter(Boolean).join(" · ");
+      if (meta) current.appendChild(makeEl("span", "run-meta", meta));
+    } else {
+      current.appendChild(makeEl(
+        "span",
+        "run-empty",
+        "No run loaded — the next Search starts a new run folder."
+      ));
+    }
+  }
+
+  const select = document.getElementById("run-select");
+  if (!select) return;
+  const previous = select.value;
+  select.innerHTML = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = runsState.runs.length
+    ? "Choose a saved run…"
+    : "No saved runs yet";
+  select.appendChild(placeholder);
+  runsState.runs.forEach(run => {
+    const option = document.createElement("option");
+    option.value = String(run.id || "");
+    option.textContent = runOptionLabel(run);
+    select.appendChild(option);
+  });
+  const ids = new Set(runsState.runs.map(run => String(run.id || "")));
+  let desired = ids.has(previous) ? previous : "";
+  if (!desired && runsState.active && ids.has(String(runsState.active.id))) {
+    desired = String(runsState.active.id);
+  }
+  if (!desired && runsState.runs.length) desired = String(runsState.runs[0].id);
+  select.value = desired;
+  select.disabled = runsState.runs.length === 0;
+  updateRunButtons();
+}
+
+async function loadRuns(options) {
+  const opts = options || {};
+  const card = document.getElementById("runs-card");
+  if (!card) return null;
+  let data;
+  try {
+    data = await getJSON("/api/runs");
+  } catch (e) {
+    card.classList.add("hidden");
+    return null;
+  }
+  runsState.enabled = !!data.enabled;
+  runsState.active = data.active || null;
+  runsState.runs = Array.isArray(data.runs) ? data.runs : [];
+  card.classList.toggle("hidden", !runsState.enabled);
+  const hint = document.getElementById("run-search-hint");
+  if (hint) hint.classList.toggle("hidden", !runsState.enabled);
+  if (!runsState.enabled) return data;
+  renderRuns();
+  if (opts.applyActive && runsState.active) {
+    try {
+      const payload = await getJSON("/api/run");
+      if (payload && payload.state) applyRunState(payload.state);
+    } catch (e) {
+      // State loading is optional: the form and results still work without it.
+    }
+  }
+  return data;
+}
+
+async function loadSelectedRun() {
+  const select = document.getElementById("run-select");
+  const runId = select ? select.value : "";
+  if (!runId) return;
+  try {
+    const data = await postJSON(
+      "/api/runs/" + encodeURIComponent(runId) + "/load",
+      {}
+    );
+    if (data.state) applyRunState(data.state);
+    await loadResults();
+    await loadRuns();
+  } catch (e) {
+    setBanner(e.message, "error");
+  }
+}
+
+async function deleteSelectedRun() {
+  const select = document.getElementById("run-select");
+  const runId = select ? select.value : "";
+  if (!runId) return;
+  const run = runsState.runs.find(item => String(item.id) === runId);
+  const name = run ? (run.name || run.id) : runId;
+  if (!window.confirm(
+    "Delete the run \"" + name + "\" and all of its files? This cannot be undone."
+  )) return;
+  try {
+    await postJSON("/api/runs/" + encodeURIComponent(runId) + "/delete", {});
+    await loadRuns();
+    flashBanner("Deleted run \"" + name + "\".", "ok", 3000);
+  } catch (e) {
+    setBanner(e.message, "error");
+  }
+}
+
+function refreshActiveRun() {
+  if (!runsState.active) {
+    setBanner("Load a run before refreshing its search.", "error");
+    return;
+  }
+  doSearch({ merge: true });
+}
+
+// Restore everything saved in a run's state.json. Loading never starts a job:
+// the user can review the form, then Search/Extract explicitly.
+function applyRunState(state) {
+  if (!state || typeof state !== "object") return;
+  const query = (state.query && typeof state.query === "object") ? state.query : {};
+  const tree = query.tree;
+  const usableTree = tree && typeof tree === "object" &&
+    (tree.type === "group" || tree.type === "term");
+  if (usableTree) {
+    queryModel.restore(tree, { preserveEmpty: true });
+    restoreQuerySelection({
+      selected_paths: query.selected_paths,
+      children_selected_paths: query.children_selected_paths,
+    });
+    renderQuery();
+  }
+
+  if (Array.isArray(state.sources)) {
+    const wanted = new Set(state.sources.map(source => String(source)));
+    document.querySelectorAll("#source-list input[type=checkbox]").forEach(cb => {
+      cb.checked = wanted.has(cb.value);
+    });
+  }
+  if ("max_results" in state && state.max_results !== null && state.max_results !== "") {
+    setFieldValue("max-results", state.max_results);
+  }
+  if ("year_from" in state) setFieldValue("year-from", state.year_from || "");
+  if ("year_to" in state) setFieldValue("year-to", state.year_to || "");
+  if ("excluded_journals" in state) {
+    const journals = state.excluded_journals;
+    setFieldValue(
+      "excluded-journals",
+      Array.isArray(journals) ? journals.join("\n") : (journals || "")
+    );
+  }
+  if ("local_folder" in state) setFieldValue("local-folder", state.local_folder || "");
+  if ("local_recursive" in state) {
+    const recursive = document.getElementById("local-recursive");
+    if (recursive) recursive.checked = !!state.local_recursive;
+  }
+
+  const extraction = (state.extraction && typeof state.extraction === "object")
+    ? state.extraction
+    : {};
+  if ("goal" in extraction) setFieldValue("goal", extraction.goal || "");
+  if ("columns" in extraction) {
+    const columns = extraction.columns;
+    setFieldValue("columns", Array.isArray(columns) ? columns.join(", ") : (columns || ""));
+  }
+  if (extraction.mode) {
+    const modeSelect = document.getElementById("extraction-mode");
+    if (modeSelect) modeSelect.value = extraction.mode === "table" ? "table" : "records";
+  }
+
+  // Email/model are non-secret app settings only. They are restored into the
+  // Settings fields for this view but are NOT saved automatically.
+  const settings = (state.settings && typeof state.settings === "object")
+    ? state.settings
+    : {};
+  if (settings.email) setFieldValue("set-email", settings.email);
+  if (settings.model) setFieldValue("set-model", settings.model);
+
+  const name = state.name || state.id || "run";
+  const date = runTimestamp(state.updated_at || state.created_at);
+  flashBanner(
+    "Loaded run \"" + name + "\"" + (date ? " (" + date + ")" : "") +
+      ". Review the form, then Search or Extract — nothing has started.",
+    "info",
+    5000
+  );
+}
+
 /* ---------- query builder (nested boolean groups) ---------- */
 
 /*
@@ -343,6 +598,8 @@ function bindHistoryClear(kind) {
  * Public API (exposed as window.queryModel):
  *   root                       - the root group node
  *   findParent(node)           - parent group of a node (or null)
+ *   pathForNode(node)          - child-index path from root, or null
+ *   nodeAtPath(path)           - node at a child-index path, or null
  *   addTerm(parent?, text?, op?) -> term node
  *   addGroup(parent?, op?)     -> group node
  *   removeNode(node)           -> boolean
@@ -377,6 +634,41 @@ const queryModel = (function () {
       }
     }
     return null;
+  }
+
+  // Stable location of a node in the tree: an array of child indices starting
+  // at the root. [] is the root itself; null means "not in this tree". Saved
+  // selection paths use these indices, so the tree must be restored with
+  // empty terms/groups preserved (see restore(..., {preserveEmpty:true})).
+  function pathForNode(node) {
+    if (!node || typeof node !== "object") return null;
+    if (node === root) return [];
+    function walk(group, base) {
+      for (let index = 0; index < group.children.length; index += 1) {
+        const child = group.children[index];
+        const path = base.concat(index);
+        if (child === node) return path;
+        if (child.type === "group") {
+          const found = walk(child, path);
+          if (found) return found;
+        }
+      }
+      return null;
+    }
+    return walk(root, []);
+  }
+
+  function nodeAtPath(path) {
+    if (!Array.isArray(path)) return null;
+    let node = root;
+    for (const index of path) {
+      if (!Number.isInteger(index) || index < 0) return null;
+      if (!node || node.type !== "group" || index >= node.children.length) {
+        return null;
+      }
+      node = node.children[index];
+    }
+    return node;
   }
 
   function addTerm(parent, text, op) {
@@ -536,13 +828,15 @@ const queryModel = (function () {
   }
 
   // Append one stored node below `parent`, creating fresh ids through
-  // addTerm/addGroup. Empty terms, empty groups and malformed objects are
-  // ignored; the caller guarantees at least one term afterwards.
-  function appendSnapshot(raw, parent) {
+  // addTerm/addGroup. By default empty terms/groups and malformed objects are
+  // ignored (history restores only meaningful queries). `preserveEmpty` keeps
+  // them, which is required when restoring a run: selection paths are child
+  // indices and must still resolve to the same nodes.
+  function appendSnapshot(raw, parent, preserveEmpty) {
     if (!raw || typeof raw !== "object") return false;
     if (raw.type === "term") {
       const text = typeof raw.text === "string" ? raw.text : "";
-      if (!text.trim()) return false;
+      if (!text.trim() && !preserveEmpty) return false;
       addTerm(parent, text, safeOperator(raw.op));
       return true;
     }
@@ -550,16 +844,19 @@ const queryModel = (function () {
     const group = addGroup(parent, safeOperator(raw.op));
     let added = 0;
     (Array.isArray(raw.children) ? raw.children : []).forEach(child => {
-      if (appendSnapshot(child, group)) added += 1;
+      if (appendSnapshot(child, group, preserveEmpty)) added += 1;
     });
-    if (!added) {
+    if (!added && !preserveEmpty) {
       removeNode(group);
       return false;
     }
     return true;
   }
 
-  function restore(snapshotTree) {
+  function restore(snapshotTree, options) {
+    const preserveEmpty = !!(
+      options && typeof options === "object" && options.preserveEmpty
+    );
     root.children = [];
     const snap = (snapshotTree && typeof snapshotTree === "object")
       ? snapshotTree
@@ -567,8 +864,8 @@ const queryModel = (function () {
     const children = !snap
       ? []
       : (snap.type === "term" ? [snap] : (Array.isArray(snap.children) ? snap.children : []));
-    children.forEach(child => appendSnapshot(child, root));
-    if (root.children.length === 0) addTerm(root);
+    children.forEach(child => appendSnapshot(child, root, preserveEmpty));
+    if (root.children.length === 0 && !preserveEmpty) addTerm(root);
     try {
       if (typeof selectedIds !== "undefined") selectedIds.clear();
       if (typeof childrenSelectedGroups !== "undefined") childrenSelectedGroups.clear();
@@ -581,6 +878,8 @@ const queryModel = (function () {
   return {
     root,
     findParent,
+    pathForNode,
+    nodeAtPath,
     addTerm,
     addGroup,
     removeNode,
@@ -724,6 +1023,67 @@ function syncSelectionUI() {
     block.classList.toggle("group-selected", selectedIds.has(node.id));
     block.classList.toggle("group-children-selected", childrenSelectedGroups.has(node.id));
   });
+}
+
+// JSON-safe checkbox selection snapshot. Paths are child indices, so the saved
+// state is independent of browser-generated node ids. A state-2 group also
+// records its descendants in selected_paths (they are selected as a whole);
+// both pieces are needed to recreate the same UI after a reload.
+function snapshotQuerySelection() {
+  const selected_paths = [];
+  const children_selected_paths = [];
+  selectedIds.forEach(id => {
+    const path = queryModel.pathForNode(findNodeById(id));
+    if (Array.isArray(path)) selected_paths.push(path);
+  });
+  childrenSelectedGroups.forEach(id => {
+    const path = queryModel.pathForNode(findNodeById(id));
+    if (Array.isArray(path)) children_selected_paths.push(path);
+  });
+  const sortPaths = paths => paths.sort((a, b) => {
+    for (let i = 0; i < Math.min(a.length, b.length); i += 1) {
+      if (a[i] !== b[i]) return a[i] - b[i];
+    }
+    return a.length - b.length;
+  });
+  return {
+    selected_paths: sortPaths(selected_paths),
+    children_selected_paths: sortPaths(children_selected_paths),
+  };
+}
+
+// Restore a saved selection after queryModel.restore(...). Invalid/malformed
+// paths are ignored; they must never prevent the rest of the state from
+// loading. The tree is expected to have been restored with preserveEmpty.
+function restoreQuerySelection(selection) {
+  selectedIds.clear();
+  childrenSelectedGroups.clear();
+  const data = (selection && typeof selection === "object") ? selection : {};
+
+  const validPaths = value => (Array.isArray(value) ? value : [])
+    .map(path => {
+      if (!Array.isArray(path)) return null;
+      const cleaned = [];
+      for (const index of path) {
+        if (!Number.isInteger(index) || index < 0) return null;
+        cleaned.push(index);
+      }
+      return cleaned;
+    })
+    .filter(Boolean);
+
+  validPaths(data.selected_paths).forEach(path => {
+    const node = queryModel.nodeAtPath(path);
+    if (node) selectedIds.add(node.id);
+  });
+  validPaths(data.children_selected_paths).forEach(path => {
+    const node = queryModel.nodeAtPath(path);
+    if (!node || node.type !== "group") return;
+    childrenSelectedGroups.add(node.id);
+    collectDescendants(node).forEach(child => selectedIds.add(child.id));
+  });
+  pruneSelection();
+  syncSelectionUI();
 }
 
 /* ---------- query builder rendering ---------- */
@@ -1271,7 +1631,9 @@ function buildQuery() {
 
 /* ---------- search & extract ---------- */
 
-async function doSearch() {
+async function doSearch(options) {
+  const opts = options || {};
+  const merge = !!opts.merge;
   setBanner("");
   const query = buildQuery();
   const sources = [...document.querySelectorAll("#source-list input:checked")].map(c => c.value);
@@ -1301,6 +1663,7 @@ async function doSearch() {
     const { job_id } = await postJSON("/api/search", {
       query,
       query_tree: queryModel.snapshot(),
+      query_selection: snapshotQuerySelection(),
       sources,
       max_results: maxResults,
       excluded_journals: document.getElementById("excluded-journals").value,
@@ -1309,6 +1672,7 @@ async function doSearch() {
       local_folder: localFolder,
       local_recursive: localRecursive,
       local_only: localOnly,
+      merge,
     });
     setBusy(true);
     showProgress(true);
@@ -1391,6 +1755,7 @@ function pollJob(jobId) {
         setBusy(false);
         showProgress(false);
         await loadResults();
+        await loadRuns();
         if (job.result && job.result.added !== undefined) {
           await refreshHistory("search");
           const excluded = job.result.excluded || 0;
@@ -1401,7 +1766,23 @@ function pollJob(jobId) {
           const localSuffix = job.result.local_folder
             ? `, ${localCount} local PDF${localCount === 1 ? "" : "s"}`
             : "";
-          setBanner(`Search finished: ${job.result.total} papers${rangeSuffix}${suffix}${localSuffix}.`, "ok");
+          const run = runsState.runs.find(item => item.id === job.result.run_id);
+          const runName = run ? run.name : "";
+          const runSuffix = runName ? ` in run \u201c${runName}\u201d` : "";
+          if (job.result.merged) {
+            const added = job.result.added || 0;
+            setBanner(
+              `Refresh finished${runSuffix}: ${job.result.total} papers ` +
+                `(${added} new${suffix}${rangeSuffix}${localSuffix}); extraction data kept.`,
+              "ok"
+            );
+          } else {
+            setBanner(
+              `Search finished${runSuffix}: ${job.result.total} papers` +
+                `${rangeSuffix}${suffix}${localSuffix}.`,
+              "ok"
+            );
+          }
         } else if (job.result && job.result.extracted !== undefined) {
           await Promise.all([refreshHistory("goal"), refreshHistory("columns")]);
           const modeLabel = job.result.mode === "table" ? "table rows" : "individual records";
@@ -1414,6 +1795,7 @@ function pollJob(jobId) {
         setBusy(false);
         showProgress(false);
         await loadResults();
+        await loadRuns();
         let summary = " Previous results were kept.";
         if (job.result && job.result.extracted !== undefined) {
           await Promise.all([refreshHistory("goal"), refreshHistory("columns")]);
@@ -1432,6 +1814,7 @@ function pollJob(jobId) {
         currentJobId = null;
         setBusy(false);
         showProgress(false);
+        await loadRuns();
         setBanner("Error: " + (job.error || "something went wrong"), "error");
       }
     } catch (e) {
@@ -2333,12 +2716,15 @@ window.addEventListener("DOMContentLoaded", async () => {
   bindNumericInputs();
   setupResultsTabs();
   setupFigureModal();
+  const runSelect = document.getElementById("run-select");
+  if (runSelect) runSelect.addEventListener("change", updateRunButtons);
   queryModel.addTerm(queryModel.root);
   queryModel.addTerm(queryModel.root);
   renderQuery();
   try {
     await Promise.all([loadSources(), loadSettings()]);
   } catch (e) { /* non-fatal */ }
+  await loadRuns({ applyActive: true });
   await loadHistory();
   await loadResults();
   await checkStatus();

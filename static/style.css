@@ -110,6 +110,22 @@ textarea { resize: vertical; }
 }
 .history-row .ghost-btn.mini { flex: none; }
 
+/* Run folders (per-search datasets) */
+.run-current {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  margin: 10px 0 4px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 8px; background: #f8fafc;
+}
+.run-current-name { font-weight: 700; font-size: 0.94rem; }
+.run-meta { color: var(--muted); font-size: 0.82rem; }
+.run-empty { color: var(--muted); font-size: 0.86rem; }
+.run-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.ghost-btn.danger { color: var(--red); border-color: #fecaca; }
+.ghost-btn.danger:hover { background: var(--red-bg); }
+.ghost-btn.danger:disabled { color: #b6c2d4; border-color: var(--line); }
+.run-hint { margin-top: 10px; }
+.run-search-hint { margin-top: 16px; }
+
 /* Query builder */
 .query-builder { margin-bottom: 10px; }
 .term-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; }
