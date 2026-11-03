@@ -24,6 +24,27 @@ for → everything lands in an Excel file in the `output/` folder.
 That's it. The Excel files are the output; the browser is just the control panel.
 
 
+## Cancelling a running job
+
+While a search or extraction is running, the progress card shows a **Cancel job**
+button. Clicking it asks the job to stop at the next safe point; the button then
+shows **Cancelling…** until the job exits. A cancelled job is reported as
+*Job cancelled* — not as an error.
+
+- **Search:** cancellation is checked before and after a local-folder scan and
+  between websites. If the job stops before its results are written, the
+  previous `search_results.xlsx`, extraction files, checkpoint, local-PDF index
+  and figure gallery are left exactly as they were.
+- **Extract:** the paper already being processed is allowed to finish. Its rows,
+  checkpoint entry and closed-source entry are saved, then the job stops before
+  the next paper. Running Extract again later resumes with the unprocessed
+  papers; completed papers are skipped as usual.
+- Cancellation is cooperative. A PubMed/Europe PMC/Crossref request or an LLM
+  call that is already in progress cannot be interrupted, so the job stops when
+  that call returns. Clicking Cancel near the end may therefore let the last
+  step finish before the job ends.
+
+
 ## Search & Extract vs Data & PDFs
 
 The results area has two tabs:

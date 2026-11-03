@@ -1,6 +1,7 @@
 "use strict";
 
 let pollTimer = null;
+let currentJobId = null;
 
 /* ---------- small helpers ---------- */
 
@@ -35,6 +36,16 @@ function setBanner(msg, type) {
 function setBusy(running) {
   document.getElementById("search-btn").disabled = running;
   document.getElementById("extract-btn").disabled = running;
+  if (!running) resetCancelButton();
+}
+
+function resetCancelButton() {
+  const btn = document.getElementById("cancel-job");
+  if (!btn) return;
+  btn.disabled = true;
+  btn.textContent = "Cancel job";
+  btn.setAttribute("aria-label", "Cancel the running job");
+  btn.classList.add("hidden");
 }
 
 /* ---------- Ollama status ---------- */
@@ -1367,6 +1378,7 @@ function showProgress(show) {
 }
 
 function pollJob(jobId) {
+  currentJobId = jobId;
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
     try {
@@ -1375,6 +1387,7 @@ function pollJob(jobId) {
       if (job.status === "done") {
         clearInterval(pollTimer);
         pollTimer = null;
+        currentJobId = null;
         setBusy(false);
         showProgress(false);
         await loadResults();
@@ -1394,9 +1407,29 @@ function pollJob(jobId) {
           const modeLabel = job.result.mode === "table" ? "table rows" : "individual records";
           setBanner(`Extraction finished (${modeLabel}): ${job.result.extracted} row(s) extracted, ${job.result.closed} paper(s) closed.`, "ok");
         }
+      } else if (job.status === "cancelled") {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        currentJobId = null;
+        setBusy(false);
+        showProgress(false);
+        await loadResults();
+        let summary = " Previous results were kept.";
+        if (job.result && job.result.extracted !== undefined) {
+          await Promise.all([refreshHistory("goal"), refreshHistory("columns")]);
+          summary = ` ${job.result.extracted} row(s) extracted, ${job.result.closed} paper(s) closed; completed rows were kept.`;
+        } else if (job.result && job.result.added !== undefined) {
+          await refreshHistory("search");
+        } else if (job.type === "extract") {
+          await Promise.all([refreshHistory("goal"), refreshHistory("columns")]);
+        } else if (job.type === "search") {
+          await refreshHistory("search");
+        }
+        setBanner("Job cancelled." + summary, "info");
       } else if (job.status === "error") {
         clearInterval(pollTimer);
         pollTimer = null;
+        currentJobId = null;
         setBusy(false);
         showProgress(false);
         setBanner("Error: " + (job.error || "something went wrong"), "error");
@@ -1404,10 +1437,42 @@ function pollJob(jobId) {
     } catch (e) {
       clearInterval(pollTimer);
       pollTimer = null;
+      currentJobId = null;
       setBusy(false);
       setBanner(e.message, "error");
     }
   }, 1200);
+}
+
+async function cancelJob() {
+  if (!currentJobId) return;
+  const jobId = currentJobId;
+  const btn = document.getElementById("cancel-job");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Cancelling…";
+  }
+  try {
+    await postJSON("/api/job/" + jobId + "/cancel", {});
+  } catch (e) {
+    setBanner(e.message, "error");
+    try {
+      const job = await getJSON("/api/job/" + jobId);
+      if (job.status === "running" && !job.cancel_requested) {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = "Cancel job";
+        }
+      } else {
+        renderProgress(job);
+      }
+    } catch (ignored) {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Cancel job";
+      }
+    }
+  }
 }
 
 function renderProgress(job) {
@@ -1423,6 +1488,24 @@ function renderProgress(job) {
   const status = document.getElementById("progress-status");
   if (p.total > 0) status.textContent = `${p.done} / ${p.total} — ${p.current || ""}`;
   else status.textContent = p.current || "Working…";
+  const cancelBtn = document.getElementById("cancel-job");
+  if (cancelBtn) {
+    const running = job.status === "running";
+    cancelBtn.classList.toggle("hidden", !running);
+    if (!running) {
+      cancelBtn.disabled = true;
+      cancelBtn.textContent = "Cancel job";
+      cancelBtn.setAttribute("aria-label", "Cancel the running job");
+    } else if (job.cancel_requested) {
+      cancelBtn.disabled = true;
+      cancelBtn.textContent = "Cancelling…";
+      cancelBtn.setAttribute("aria-label", "Cancellation requested");
+    } else {
+      cancelBtn.disabled = false;
+      cancelBtn.textContent = "Cancel job";
+      cancelBtn.setAttribute("aria-label", "Cancel the running job");
+    }
+  }
   const log = document.getElementById("log");
   log.textContent = (job.log || []).join("\n");
   log.scrollTop = log.scrollHeight;

@@ -159,6 +159,7 @@ def _new_job(job_type):
         "progress": {"done": 0, "total": 0, "current": ""},
         "log": [],
         "result": None,
+        "cancel_requested": False,
     }
     JOBS[job["id"]] = job
     return job
@@ -174,7 +175,7 @@ def _active_job():
 def _start_job(job_type, fn, *args):
     with JOB_LOCK:
         if _active_job():
-            return None, "A task is already running. Wait for it to finish, then try again."
+            return None, "A task is already running. Cancel it or wait for it to finish, then try again."
         job = _new_job(job_type)
     threading.Thread(target=fn, args=(job, *args), daemon=True).start()
     return job, None
@@ -191,6 +192,7 @@ def _job_public(job):
         "progress": job["progress"],
         "log": job["log"][-40:],
         "result": job["result"],
+        "cancel_requested": bool(job.get("cancel_requested", False)),
     }
 
 
@@ -219,6 +221,18 @@ def _record_history(job, kind, data):
 
 _YEARS_UNSET = object()
 _LOCAL_UNSET = object()
+
+
+def _cancel_requested(job):
+    return bool(job.get("cancel_requested"))
+
+
+def _mark_search_cancelled(job):
+    """Finish a search job as cancelled without touching any output files."""
+    job["status"] = "cancelled"
+    job["error"] = None
+    job["result"] = {"cancelled": True}
+    job["log"].append("Search cancelled; previous results were kept.")
 
 
 def _run_search_job(job, query, sources, max_results, excluded_journals=None,
@@ -302,7 +316,12 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None,
 
         # Scan inside the job so a large folder reports progress instead of
         # blocking the request. Invalid folders are also rejected by /api/search.
+        # Cancellation is cooperative: a scan that is already running finishes,
+        # then the job stops before any online search or output write.
         local_papers, local_stats = [], None
+        if _cancel_requested(job):
+            _mark_search_cancelled(job)
+            return
         if local_folder:
             local_papers, local_stats = local_pdfs.scan_folder(
                 local_folder, recursive=local_recursive
@@ -317,14 +336,30 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None,
             for detail in local_stats.get("error_details", [])[:5]:
                 job["log"].append(f"   !! {detail['file']}: {detail['error']}")
 
+        if _cancel_requested(job):
+            _mark_search_cancelled(job)
+            return
+
         if online:
-            papers = searchers.search(
-                query, sources, limit=max_results,
-                year_from=year_from, year_to=year_to,
-            )
+            try:
+                papers = searchers.search(
+                    query, sources, limit=max_results,
+                    year_from=year_from, year_to=year_to,
+                    cancel_check=lambda: _cancel_requested(job),
+                )
+            except searchers.SearchCancelled:
+                _mark_search_cancelled(job)
+                return
         else:
             papers = []
             job["log"].append("Online search skipped (folder-only).")
+
+        # The callback is checked between sources, so the last source may have
+        # finished after a cancel click. Check once more before any existing
+        # output is replaced.
+        if _cancel_requested(job):
+            _mark_search_cancelled(job)
+            return
 
         if local_papers:
             before_local = len(papers)
@@ -380,6 +415,8 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None,
             f"({len(excluded)} excluded by journal{year_note}{local_note}; "
             "previous data cleared)."
         )
+    except searchers.SearchCancelled:
+        _mark_search_cancelled(job)
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
@@ -433,6 +470,7 @@ def _run_extract_job(job, goal, columns, mode="records"):
                 "closed": 0,
                 "papers_processed": 0,
                 "mode": mode,
+                "cancelled": False,
             }
             job["log"].append("No search results yet — run a search first.")
             return
@@ -472,10 +510,15 @@ def _run_extract_job(job, goal, columns, mode="records"):
         n_figures_saved = n_figure_duplicates = n_figures_capped = 0
         n_figure_warnings = 0
         first_write = True
+        processed = 0
+        cancelled = False
         for i, p in enumerate(todo):
+            if _cancel_requested(job):
+                cancelled = True
+                break
             k = paper_identity(p)
             title = (p.get("title") or "")[:60]
-            job["progress"]["done"] = i
+            job["progress"]["done"] = processed
             job["progress"]["current"] = title
             job["log"].append(f"[{i + 1}/{len(todo)}] {title}")
 
@@ -484,6 +527,10 @@ def _run_extract_job(job, goal, columns, mode="records"):
             except Exception as e:
                 cp.mark(k, "error", error=str(e))
                 job["log"].append(f"   !! fetch error: {e}")
+                processed += 1
+                if _cancel_requested(job):
+                    cancelled = True
+                    break
                 continue
 
             pdf_file = pdf.get("filename") or ""
@@ -495,6 +542,10 @@ def _run_extract_job(job, goal, columns, mode="records"):
                 cp.mark(k, "closed", reason=reason, pdf_file=pdf_file, pdf_source=pdf_source)
                 n_closed += 1
                 job["log"].append(f"   -> closed source ({reason})")
+                processed += 1
+                if _cancel_requested(job):
+                    cancelled = True
+                    break
                 continue
 
             try:
@@ -502,6 +553,10 @@ def _run_extract_job(job, goal, columns, mode="records"):
             except Exception as e:
                 cp.mark(k, "error", error=str(e))
                 job["log"].append(f"   !! extract error: {e}")
+                processed += 1
+                if _cancel_requested(job):
+                    cancelled = True
+                    break
                 continue
 
             records = [r for r in rows if isinstance(r, dict)]
@@ -583,13 +638,17 @@ def _run_extract_job(job, goal, columns, mode="records"):
 
             cp.mark(k, "extracted", n=len(out_rows), pdf_file=pdf_file, pdf_source=pdf_source)
             job["log"].append(f"   -> {len(out_rows)} row(s)")
+            processed += 1
+            # Cancellation is cooperative: the paper above always completes and
+            # its rows/checkpoint entry are already saved before this check.
+            if _cancel_requested(job):
+                cancelled = True
+                break
 
-        job["progress"]["done"] = len(todo)
-        job["progress"]["current"] = ""
-        job["result"] = {
+        result = {
             "extracted": n_extracted,
             "closed": n_closed,
-            "papers_processed": len(todo),
+            "papers_processed": processed if cancelled else len(todo),
             "mode": mode,
             "evidence_located": n_evidence_located,
             "evidence_unresolved": n_evidence_unresolved,
@@ -598,7 +657,21 @@ def _run_extract_job(job, goal, columns, mode="records"):
             "figure_duplicates": n_figure_duplicates,
             "figures_capped": n_figures_capped,
             "figure_warnings": n_figure_warnings,
+            "cancelled": cancelled,
         }
+        job["result"] = result
+        if cancelled:
+            job["progress"]["done"] = processed
+            job["progress"]["current"] = ""
+            job["status"] = "cancelled"
+            job["log"].append(
+                f"Extraction cancelled after {processed} paper(s); "
+                "completed rows were kept."
+            )
+            return
+
+        job["progress"]["done"] = len(todo)
+        job["progress"]["current"] = ""
         job["status"] = "done"
         job["log"].append(f"Done: {n_extracted} row(s) extracted, {n_closed} paper(s) closed.")
     except Exception as e:
@@ -895,6 +968,36 @@ def api_job(job_id):
     if not job:
         return jsonify({"error": "unknown job"}), 404
     return jsonify(_job_public(job))
+
+
+@app.route("/api/job/<job_id>/cancel", methods=["POST"])
+def api_job_cancel(job_id):
+    """Request cooperative cancellation of a running job.
+
+    The job stays `running` until its body reaches the next cancellation check;
+    an in-flight HTTP or LLM call always finishes first. Repeated requests while
+    the job is still running are accepted.
+    """
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "unknown job"}), 404
+        if job["status"] != "running":
+            return jsonify({
+                "error": "job is not running",
+                "status": job["status"],
+            }), 409
+        first_request = not job.get("cancel_requested")
+        job["cancel_requested"] = True
+        if first_request:
+            job["log"].append(
+                "Cancel requested; stopping after the current step."
+            )
+        return jsonify({
+            "cancelled": True,
+            "status": "running",
+            "cancel_requested": True,
+        })
 
 
 def _read_xlsx(path):
