@@ -87,6 +87,9 @@ async function loadSettings() {
   document.getElementById("set-model").value = s.model || "";
   document.getElementById("set-max").value = s.max_results || 50;
   document.getElementById("max-results").value = s.max_results || 50;
+  const journals = s.excluded_journals;
+  document.getElementById("excluded-journals").value =
+    Array.isArray(journals) ? journals.join("\n") : (journals || "");
 }
 
 async function saveSettings() {
@@ -95,6 +98,7 @@ async function saveSettings() {
       email: document.getElementById("set-email").value.trim(),
       model: document.getElementById("set-model").value.trim(),
       max_results: parseInt(document.getElementById("set-max").value, 10) || 50,
+      excluded_journals: document.getElementById("excluded-journals").value,
     };
     await postJSON("/api/settings", body);
     document.getElementById("max-results").value = body.max_results;
@@ -113,7 +117,7 @@ async function saveSettings() {
  * ----------
  * Nodes are either:
  *   { id: string, type: "term",  text: string, op: "AND"|"OR"|"NOT" }
- *   { id: string, type: "group", op: "AND"|"OR", children: Node[] }
+ *   { id: string, type: "group", op: "AND"|"OR"|"NOT", children: Node[] }
  *
  * Every node gets a stable `id` when it is created. Selection state is keyed
  * by these ids (see the selection section below) so it survives re-renders and
@@ -844,7 +848,7 @@ function renderGroupBlock(node, index) {
 
   head.appendChild(makeSelectCheckbox(node));
 
-  const op = makeOpSelect(node, index, ["AND", "OR"]);
+  const op = makeOpSelect(node, index, ["AND", "OR", "NOT"]);
   if (op) head.appendChild(op);
 
   const label = document.createElement("span");
@@ -969,7 +973,12 @@ async function doSearch() {
   if (!sources.length) { setBanner("Choose at least one website.", "error"); return; }
 
   try {
-    const { job_id } = await postJSON("/api/search", { query, sources, max_results: maxResults });
+    const { job_id } = await postJSON("/api/search", {
+      query,
+      sources,
+      max_results: maxResults,
+      excluded_journals: document.getElementById("excluded-journals").value,
+    });
     setBusy(true);
     showProgress(true);
     pollJob(job_id);
@@ -1050,7 +1059,9 @@ function pollJob(jobId) {
         showProgress(false);
         await loadResults();
         if (job.result && job.result.added !== undefined) {
-          setBanner(`Search finished: ${job.result.total} papers.`, "ok");
+          const excluded = job.result.excluded || 0;
+          const suffix = excluded ? ` (${excluded} excluded by journal)` : "";
+          setBanner(`Search finished: ${job.result.total} papers${suffix}.`, "ok");
         } else if (job.result && job.result.extracted !== undefined) {
           const modeLabel = job.result.mode === "table" ? "table rows" : "individual records";
           setBanner(`Extraction finished (${modeLabel}): ${job.result.extracted} row(s) extracted, ${job.result.closed} paper(s) closed.`, "ok");

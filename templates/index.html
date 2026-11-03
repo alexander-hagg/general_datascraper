@@ -26,7 +26,10 @@
       <h2><span class="step">1</span> Search for papers</h2>
 
       <label class="field-label">Search terms</label>
-      <p class="hint">Combine rows with AND/OR/NOT and groups with AND/OR. Select rows or groups
+      <p class="hint">Combine rows with AND/OR/NOT and groups with AND/OR/NOT. A group
+        set to NOT is excluded from the part of the query before it, so
+        <code>A AND B NOT (predatory OR questionable)</code> finds A and B while
+        dropping anything that matches the NOT group. Select rows or groups
         with the checkboxes, then wrap them into a nested group. Click a group header to cycle
         its selection (group → members → group). Multi-word terms are quoted automatically.</p>
       <div id="term-list" class="query-builder"></div>
@@ -54,6 +57,13 @@
           <input type="text" inputmode="numeric" pattern="[0-9]*" data-numeric id="max-results" value="50">
         </div>
       </div>
+
+      <label class="field-label" for="excluded-journals">Exclude journals <span class="muted">(optional, one per line)</span></label>
+      <textarea id="excluded-journals" rows="3" placeholder="e.g. Predatory Journal of Examples&#10;Journal of Questionable Results"></textarea>
+      <p class="hint">One journal name per line. Matching is case-insensitive and uses
+        substrings, so differences in capitalisation, spacing, or extra punctuation are
+        caught too. It is applied after the search, to the combined results from every
+        website; papers with no journal name are never excluded.</p>
 
       <button class="primary-btn" id="search-btn" onclick="doSearch()">Search papers</button>
     </section>

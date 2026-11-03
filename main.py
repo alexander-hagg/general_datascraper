@@ -25,6 +25,7 @@ from openpyxl import load_workbook
 import config
 import extractor
 import fetcher
+import filters
 import pdf_fetcher
 import searchers
 import writer
@@ -250,9 +251,16 @@ def run_search():
     papers = searchers.merge_papers(existing, new_papers)
     added = len(papers) - len(existing)
 
+    # Journal blocklist is applied to the MERGED set, not inside each source
+    # client, so rows already in search_results.xlsx are also removed when they
+    # start matching a newly-added journal name.
+    terms = filters.parse_journal_terms(getattr(config, "EXCLUDED_JOURNALS", []))
+    papers, excluded = filters.filter_papers(papers, terms)
+
     rows = [paper_to_row(p) for p in papers]
     writer.write_xlsx(config.SEARCH_RESULTS_XLSX, SEARCH_COLS, rows)
     print(f"Wrote {len(rows)} papers ({added} new) to {config.SEARCH_RESULTS_XLSX}")
+    print(f"Excluded {len(excluded)} paper(s) by journal blocklist.")
     return papers
 
 

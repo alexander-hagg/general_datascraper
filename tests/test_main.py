@@ -1,5 +1,7 @@
 """Tests for identity, extraction modes, row indexes and validation."""
 
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -108,6 +110,67 @@ class SearchIdentityTests(unittest.TestCase):
         row = dict(zip(rows[0], rows[1]))
         self.assertEqual(row["paper_key"], "pmid:42")
         self.assertEqual(row["title"], "Paper")
+
+
+class JournalFilterSearchTests(unittest.TestCase):
+    def test_run_search_filters_merged_rows_and_reports_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            search = Path(tmp) / "search_results.xlsx"
+            # Existing workbook: one row that the new blocklist now removes and
+            # one that must survive the merge.
+            make_search_workbook(search, [
+                ["pubmed", "Old blocked", "A", "10.1/old-blocked", "", "", "2020",
+                 "Predatory Journal of Examples", "yes", ""],
+                ["pubmed", "Old kept", "B", "10.1/old-kept", "", "", "2020",
+                 "Good Journal", "yes", ""],
+            ])
+            new_papers = [
+                {"sources": ["crossref"], "title": "New blocked", "doi": "10.1/new-blocked",
+                 "year": "2021", "journal": "PREDATORY JOURNAL OF EXAMPLES"},
+                {"sources": ["crossref"], "title": "New kept", "doi": "10.1/new-kept",
+                 "year": "2021", "journal": "Good Journal"},
+                {"sources": ["crossref"], "title": "No journal", "doi": "10.1/no-journal",
+                 "year": "2021", "journal": ""},
+            ]
+
+            output = io.StringIO()
+            with mock.patch.object(main.config, "SEARCH_RESULTS_XLSX", search), \
+                 mock.patch.object(main.config, "EXCLUDED_JOURNALS",
+                                   ["predatory journal of examples"]), \
+                 mock.patch.object(main.searchers, "search_all", lambda: new_papers), \
+                 contextlib.redirect_stdout(output):
+                papers = main.run_search()
+
+            self.assertEqual(
+                [p["title"] for p in papers],
+                ["Old kept", "New kept", "No journal"],
+            )
+            rows = read_sheet(search)
+            header = rows[0]
+            titles = [dict(zip(header, row))["title"] for row in rows[1:]]
+            self.assertEqual(titles, ["Old kept", "New kept", "No journal"])
+            self.assertIn("Excluded 2 paper(s) by journal blocklist.", output.getvalue())
+
+    def test_run_search_without_blocklist_keeps_everything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            search = Path(tmp) / "search_results.xlsx"
+            paper = {
+                "sources": ["pubmed"],
+                "title": "Paper",
+                "doi": "10.1/X",
+                "journal": "Any Journal",
+                "is_oa": True,
+            }
+            output = io.StringIO()
+            with mock.patch.object(main.config, "SEARCH_RESULTS_XLSX", search), \
+                 mock.patch.object(main.config, "EXCLUDED_JOURNALS", []), \
+                 mock.patch.object(main.searchers, "search_all", lambda: [paper]), \
+                 mock.patch.object(main, "_load_search_results", lambda required=False: []), \
+                 contextlib.redirect_stdout(output):
+                papers = main.run_search()
+
+            self.assertEqual([p["title"] for p in papers], ["Paper"])
+            self.assertIn("Excluded 0 paper(s) by journal blocklist.", output.getvalue())
 
 
 class ExtractRowTests(unittest.TestCase):

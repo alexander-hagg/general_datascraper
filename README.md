@@ -107,7 +107,21 @@ the condition that led to the decision. The run ends with
 The search box supports nested groups, similar to PubMed Advanced Search
 or Web of Science history combining. Each row after the first has its own
 AND/OR/NOT connector, and rows can be wrapped into a group with its own
-AND/OR connector. Groups can be nested arbitrarily.
+AND/OR/NOT connector. Groups can be nested arbitrarily.
+
+A group whose connector is **NOT** is excluded from the part of the query
+before it. For example:
+
+```
+A AND B NOT (predatory OR questionable)
+```
+
+finds papers matching A and B, then removes anything that matches either
+`predatory` or `questionable`. PubMed and Europe PMC apply this boolean logic
+directly; Crossref's `query` is relevance-based, so it treats the words as
+search terms rather than strict boolean filtering. In the builder, put `A` and
+`B` at the top level, add a group with `predatory` and `questionable`, then set
+the group's connector to **NOT**.
 
 - Use the checkboxes to select one or more rows/groups, then click
   **Wrap selected in group**.
@@ -135,10 +149,57 @@ Example queries you can build:
 "Epithelial Sodium Channel" AND (missense OR mutation)
 (ENaC OR "epithelial sodium channel" OR SCNN1) AND (missense OR mutation)
 A AND (B OR (C AND D))
+A AND B NOT (predatory OR questionable)
 ```
 
 Multi-word terms are quoted automatically, so `Epithelial Sodium Channel` is
 emitted as `"Epithelial Sodium Channel"` in the first example.
+
+
+## Excluding journals
+
+The **Exclude journals** box in the Search card lets you drop papers from
+specific journals after the search has run. Put **one journal name per line**,
+for example:
+
+```
+Predatory Journal of Examples
+Journal of Questionable Results
+```
+
+Matching is **case-insensitive** and uses **substrings**, so a full journal name
+also catches records with different capitalisation, spacing, or extra punctuation
+around the name (for example `journal of questionable results.`). Papers with no
+journal name are never excluded. Because the match is a substring, a very short
+entry can catch unrelated journals — use the full journal name where possible.
+
+The same list can be set in `config.py`:
+
+```python
+EXCLUDED_JOURNALS = [
+    "Predatory Journal of Examples",
+    "Journal of Questionable Results",
+]
+```
+
+Things to know:
+
+- The filter runs **after** all websites have answered and their results have
+  been merged, never inside an individual source query. It therefore also removes
+  rows that were already in `search_results.xlsx` when the CLI merges a new
+  search into the old sheet. The web app replaces the sheet on every search, so
+  it filters the fresh result set.
+- The app shows how many papers were removed
+  (`Search finished: 42 papers (3 excluded by journal).`), and the CLI prints
+  `Excluded N paper(s) by journal blocklist.`
+- The list is saved with the other web settings, so it comes back the next time
+  you open the app. A search also saves it automatically, without clicking
+  **Save settings**.
+- Journal exclusions are **not** pushed into PubMed, Europe PMC or Crossref
+  queries. In particular, Crossref's `query` parameter is relevance-based rather
+  than strict boolean matching, so the blocklist is the only reliable way to
+  remove those records.
+
 
 ## Search suggestions
 
