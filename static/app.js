@@ -380,7 +380,7 @@ function updateRunButtons() {
   const refresh = document.getElementById("run-refresh");
   const remove = document.getElementById("run-delete");
   if (load) load.disabled = busy || !selected;
-  if (refresh) refresh.disabled = busy || !runsState.active;
+  if (refresh) refresh.disabled = busy || !runsState.active || selected !== activeId;
   if (remove) remove.disabled = busy || !selected || selected === activeId;
 }
 
@@ -1683,8 +1683,8 @@ async function doSearch(options) {
 }
 
 const RESERVED_COLUMNS = new Set([
-  "paper_key", "row_index", "evidence", "evidence_page", "pdf_file", "pdf_source",
-  "doi", "source",
+  "paper_key", "row_index", "publication_type", "evidence", "evidence_page",
+  "pdf_file", "pdf_source", "doi", "source",
 ]);
 
 function parseColumnInput(value) {
