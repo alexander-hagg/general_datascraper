@@ -26,6 +26,7 @@ from openpyxl import load_workbook
 import config
 import extractor
 import fetcher
+import filters
 import searchers
 import suggester
 import writer
@@ -63,6 +64,9 @@ def _default_settings():
         "email": config.NCBI_EMAIL,
         "model": config.OLLAMA_MODEL,
         "max_results": config.DEFAULT_MAX_RESULTS,
+        "excluded_journals": filters.parse_journal_terms(
+            getattr(config, "EXCLUDED_JOURNALS", [])
+        ),
     }
 
 
@@ -72,6 +76,9 @@ def load_settings():
             data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
             d = _default_settings()
             d.update({k: v for k, v in data.items() if k in d})
+            d["excluded_journals"] = filters.parse_journal_terms(
+                d.get("excluded_journals")
+            )
             return d
         except Exception:
             return _default_settings()
@@ -150,24 +157,41 @@ def _paper_to_row(p):
     return paper_to_row(p)
 
 
-def _run_search_job(job, query, sources, max_results):
+def _run_search_job(job, query, sources, max_results, excluded_journals=None):
     try:
         apply_settings(load_settings())
+        # Old callers/clients may not pass a blocklist: fall back to the saved
+        # web setting, which itself defaults to config.EXCLUDED_JOURNALS.
+        if excluded_journals is None:
+            excluded_journals = load_settings().get("excluded_journals")
+        terms = filters.parse_journal_terms(excluded_journals)
         job["log"].append(f"Query: {query}")
         job["log"].append(f"Websites: {', '.join(sources)}")
+        if terms:
+            job["log"].append("Journal blocklist: " + ", ".join(terms))
         # A new search starts a fresh dataset: replace the search sheet AND clear
         # any previous extraction outputs + resume state, so Extract only ever
         # works on this search's papers.
         papers = searchers.search(query, sources, limit=max_results)
+        papers, excluded = filters.filter_papers(papers, terms)
         rows = [_paper_to_row(p) for p in papers]
         writer.write_xlsx(config.SEARCH_RESULTS_XLSX, SEARCH_COLS, rows)
         for path in (config.EXTRACTED_XLSX, config.CLOSED_SOURCE_XLSX):
             if Path(path).exists():
                 Path(path).unlink()
         Checkpoint(config.CHECKPOINT_JSON).reset()
-        job["result"] = {"papers": rows, "added": len(rows), "total": len(rows)}
+        job["result"] = {
+            "papers": rows,
+            "added": len(rows),
+            "total": len(rows),
+            "excluded": len(excluded),
+        }
         job["status"] = "done"
-        job["log"].append(f"Done: {len(rows)} papers in the sheet (previous data cleared).")
+        job["log"].append(f"Excluded {len(excluded)} paper(s) by journal blocklist.")
+        job["log"].append(
+            f"Done: {len(rows)} papers in the sheet "
+            f"({len(excluded)} excluded by journal; previous data cleared)."
+        )
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
@@ -414,6 +438,10 @@ def api_settings():
                 s["max_results"] = int(data["max_results"])
             except (TypeError, ValueError):
                 pass
+        if data.get("excluded_journals") is not None:
+            s["excluded_journals"] = filters.parse_journal_terms(
+                data["excluded_journals"]
+            )
         save_settings(s)
         apply_settings(s)
         return jsonify(s)
@@ -425,7 +453,8 @@ def api_search():
     data = request.get_json(force=True, silent=True) or {}
     query = (data.get("query") or "").strip()
     sources = data.get("sources") or []
-    max_results = data.get("max_results") or load_settings().get("max_results") or config.DEFAULT_MAX_RESULTS
+    settings = load_settings()
+    max_results = data.get("max_results") or settings.get("max_results") or config.DEFAULT_MAX_RESULTS
     if not query:
         return jsonify({"error": "Enter at least one search term."}), 400
     if not sources:
@@ -434,9 +463,25 @@ def api_search():
         max_results = int(max_results)
     except (TypeError, ValueError):
         max_results = config.DEFAULT_MAX_RESULTS
-    job, err = _start_job("search", _run_search_job, query, sources, max_results)
+
+    # New clients send the textarea contents. Old clients omit the key and get
+    # the saved setting (which defaults to config.EXCLUDED_JOURNALS).
+    raw_journals = data.get("excluded_journals")
+    excluded_journals = filters.parse_journal_terms(
+        settings.get("excluded_journals") if raw_journals is None else raw_journals
+    )
+
+    job, err = _start_job(
+        "search", _run_search_job, query, sources, max_results, excluded_journals
+    )
     if err:
         return jsonify({"error": err}), 409
+    # A search is an implicit save for the blocklist: the user should not have
+    # to click "Save settings" for the exclusion they just typed to be used
+    # again next time.
+    if raw_journals is not None:
+        settings["excluded_journals"] = excluded_journals
+        save_settings(settings)
     return jsonify({"job_id": job["id"]})
 
 

@@ -1,5 +1,6 @@
 """Flask API tests: legacy results and extraction payload compatibility."""
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -216,6 +217,197 @@ class ExtractJobMigrationTests(unittest.TestCase):
             self.assertEqual(objects[1]["mutation"], "M2")
             self.assertEqual(objects[1]["paper_key"], "pmid:555")
             self.assertEqual(objects[1]["row_index"], 1)
+
+
+class SearchApiJournalTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.settings_path = self.dir / "web_settings.json"
+        self.client = web.app.test_client()
+        self.calls = []
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _fake_start(self, job_type, fn, *args):
+        self.calls.append((job_type, fn, args))
+        return {"id": "job123"}, None
+
+    def _post(self, payload):
+        with mock.patch.object(web, "_start_job", new=self._fake_start), \
+             mock.patch.object(web, "SETTINGS_PATH", self.settings_path):
+            return self.client.post("/api/search", json=payload)
+
+    def test_new_client_exclusions_are_parsed_forwarded_and_persisted(self):
+        response = self._post({
+            "query": "A AND B",
+            "sources": ["pubmed"],
+            "max_results": 5,
+            "excluded_journals": "  Foo Journal \n\nfoo journal\n Bar Journal ",
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.calls[0][0], "search")
+        self.assertEqual(
+            self.calls[0][2],
+            ("A AND B", ["pubmed"], 5, ["Foo Journal", "Bar Journal"]),
+        )
+        saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["excluded_journals"], ["Foo Journal", "Bar Journal"])
+
+    def test_old_client_without_key_falls_back_to_saved_setting(self):
+        self.settings_path.write_text(
+            json.dumps({"excluded_journals": ["Saved Journal"]}), encoding="utf-8"
+        )
+        response = self._post({
+            "query": "A",
+            "sources": ["crossref"],
+            "max_results": 3,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.calls[0][2],
+            ("A", ["crossref"], 3, ["Saved Journal"]),
+        )
+
+    def test_old_client_without_settings_falls_back_to_config(self):
+        with mock.patch.object(web.config, "EXCLUDED_JOURNALS", ["Configured Journal"]):
+            response = self._post({
+                "query": "A",
+                "sources": ["europepmc"],
+                "max_results": 4,
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.calls[0][2],
+            ("A", ["europepmc"], 4, ["Configured Journal"]),
+        )
+        self.assertFalse(self.settings_path.exists())
+
+    def test_rejected_search_does_not_start_a_job(self):
+        response = self._post({"query": "", "sources": ["pubmed"]})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.calls, [])
+
+
+class SettingsApiJournalTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.settings_path = self.dir / "web_settings.json"
+        self.client = web.app.test_client()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _request(self, method, payload=None):
+        with mock.patch.object(web, "SETTINGS_PATH", self.settings_path), \
+             mock.patch.object(web, "apply_settings", lambda s: None):
+            if method == "POST":
+                return self.client.post("/api/settings", json=payload)
+            return self.client.get("/api/settings")
+
+    def test_excluded_journals_round_trip_as_text(self):
+        response = self._request("POST", {
+            "excluded_journals": "Journal One\n\nJOURNAL ONE\n Journal Two \n",
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["excluded_journals"], ["Journal One", "Journal Two"])
+
+        fetched = self._request("GET").get_json()
+        self.assertEqual(fetched["excluded_journals"], ["Journal One", "Journal Two"])
+
+    def test_excluded_journals_accepts_a_list(self):
+        response = self._request("POST", {
+            "excluded_journals": ["Journal One", "journal one", "Journal Two"],
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["excluded_journals"], ["Journal One", "Journal Two"])
+
+    def test_missing_setting_defaults_to_config(self):
+        with mock.patch.object(web.config, "EXCLUDED_JOURNALS", ["From Config"]):
+            fetched = self._request("GET").get_json()
+        self.assertEqual(fetched["excluded_journals"], ["From Config"])
+
+
+class SearchJobJournalTests(unittest.TestCase):
+    def _job(self):
+        return {
+            "log": [],
+            "progress": {"done": 0, "total": 0, "current": ""},
+            "result": None,
+            "status": "running",
+            "error": None,
+        }
+
+    def test_search_job_filters_results_and_reports_excluded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            search = tmp / "search_results.xlsx"
+            papers = [
+                {"sources": ["pubmed"], "title": "Blocked", "doi": "10.1/blocked",
+                 "journal": "Predatory Journal of Examples"},
+                {"sources": ["pubmed"], "title": "Kept", "doi": "10.1/kept",
+                 "journal": "Good Journal"},
+                {"sources": ["pubmed"], "title": "No journal", "doi": "10.1/no-journal",
+                 "journal": ""},
+            ]
+            job = self._job()
+            with mock.patch.object(web.config, "SEARCH_RESULTS_XLSX", search), \
+                 mock.patch.object(web.config, "EXTRACTED_XLSX", tmp / "extracted.xlsx"), \
+                 mock.patch.object(web.config, "CLOSED_SOURCE_XLSX", tmp / "closed.xlsx"), \
+                 mock.patch.object(web.config, "CHECKPOINT_JSON", tmp / "checkpoint.json"), \
+                 mock.patch.object(web, "apply_settings", lambda s: None), \
+                 mock.patch.object(web, "load_settings", lambda: {}), \
+                 mock.patch.object(
+                     web.searchers, "search",
+                     lambda query, sources, limit=None: list(papers),
+                 ):
+                web._run_search_job(
+                    job, "A", ["pubmed"], 10, ["predatory journal of examples"]
+                )
+
+            self.assertEqual(job["status"], "done")
+            self.assertEqual(job["result"]["excluded"], 1)
+            self.assertEqual(job["result"]["total"], 2)
+            self.assertEqual(job["result"]["added"], 2)
+            self.assertIn(
+                "Excluded 1 paper(s) by journal blocklist.",
+                "\n".join(job["log"]),
+            )
+
+            rows = read_sheet(search)
+            header = rows[0]
+            titles = [dict(zip(header, row))["title"] for row in rows[1:]]
+            self.assertEqual(titles, ["Kept", "No journal"])
+
+    def test_search_job_without_explicit_terms_uses_saved_setting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            search = tmp / "search_results.xlsx"
+            papers = [
+                {"sources": ["pubmed"], "title": "Blocked",
+                 "journal": "Journal of Bad Results"},
+            ]
+            job = self._job()
+            with mock.patch.object(web.config, "SEARCH_RESULTS_XLSX", search), \
+                 mock.patch.object(web.config, "EXTRACTED_XLSX", tmp / "extracted.xlsx"), \
+                 mock.patch.object(web.config, "CLOSED_SOURCE_XLSX", tmp / "closed.xlsx"), \
+                 mock.patch.object(web.config, "CHECKPOINT_JSON", tmp / "checkpoint.json"), \
+                 mock.patch.object(web, "apply_settings", lambda s: None), \
+                 mock.patch.object(
+                     web, "load_settings",
+                     lambda: {"excluded_journals": ["bad results"]},
+                 ), \
+                 mock.patch.object(
+                     web.searchers, "search",
+                     lambda query, sources, limit=None: list(papers),
+                 ):
+                web._run_search_job(job, "A", ["pubmed"], 10)
+
+            self.assertEqual(job["status"], "done")
+            self.assertEqual(job["result"]["excluded"], 1)
+            self.assertEqual(job["result"]["total"], 0)
 
 
 if __name__ == "__main__":

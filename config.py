@@ -39,6 +39,17 @@ SOURCES = ["pubmed", "europepmc", "crossref"]
 # Safety cap: max results per query, per source. Raise/lower as you like.
 MAX_RESULTS_PER_QUERY = 50
 
+# Journals to drop from the results. Matching is case-insensitive and uses
+# substrings, so a full journal name also catches capitalization/spacing
+# differences and extra punctuation. It is applied AFTER all sources are
+# merged, so papers already in search_results.xlsx are removed too.
+# Add one journal name per line, for example:
+# EXCLUDED_JOURNALS = [
+#     "Predatory Journal of Examples",
+#     "Journal of Questionable Results",
+# ]
+EXCLUDED_JOURNALS = []
+
 # NCBI policy REQUIRES an email for PubMed access. Use your real one.
 # (It is only used for contact / rate-limiting, not authentication.)
 NCBI_EMAIL = "you@uni.de"
