@@ -37,15 +37,16 @@ import writer
 from checkpoint import Checkpoint
 
 SEARCH_COLS = [
-    "paper_key", "source", "title", "authors", "doi", "pmid", "pmcid",
-    "year", "journal", "is_open_access", "fulltext_url",
+    "paper_key", "source", "publication_type", "title", "authors", "doi",
+    "pmid", "pmcid", "year", "journal", "is_open_access", "fulltext_url",
 ]
-CLOSED_COLS = ["title", "authors", "doi", "source", "reason"]
+CLOSED_COLS = ["title", "authors", "doi", "source", "publication_type", "reason"]
 
 # Columns that belong to the pipeline, not to the user's extracted fields.
 # They are produced automatically and can never be supplied as web columns.
 RESERVED_COLUMNS = (
-    "paper_key", "row_index", "evidence", "evidence_page", "pdf_file", "pdf_source",
+    "paper_key", "row_index", "publication_type",
+    "evidence", "evidence_page", "pdf_file", "pdf_source",
 )
 # `doi` and `source` are pre-existing metadata columns; letting a user-supplied
 # field use those names would create duplicate Excel headers and overwrite the
@@ -53,7 +54,7 @@ RESERVED_COLUMNS = (
 PROTECTED_COLUMNS = RESERVED_COLUMNS + ("doi", "source")
 
 EXTRACT_META_COLUMNS = (
-    "paper_key", "row_index", "doi", "source",
+    "paper_key", "row_index", "doi", "source", "publication_type",
     "pdf_file", "pdf_source", "evidence", "evidence_page",
 )
 
@@ -208,6 +209,7 @@ def paper_to_row(paper):
     return {
         "paper_key": paper_identity(paper),
         "source": ", ".join(paper.get("sources", [])),
+        "publication_type": paper.get("publication_type", ""),
         "title": paper.get("title", ""),
         "authors": paper.get("authors", ""),
         "doi": paper.get("doi", ""),
@@ -233,6 +235,7 @@ def build_extract_rows(paper, records, field_names, pdf_file="", pdf_source="non
         "paper_key": paper_identity(paper),
         "doi": paper.get("doi", ""),
         "source": ", ".join(paper.get("sources", [])),
+        "publication_type": paper.get("publication_type", ""),
         "pdf_file": pdf_file,
         "pdf_source": pdf_source,
         "evidence": "",
@@ -336,6 +339,10 @@ def _load_search_results(required=True):
                 "first (or run `python main.py` to do everything)."
             )
         return local_pdfs.attach_to_papers([])
+    # Older search sheets predate publication_type. Add it in place with blank
+    # values before reading so extract-only runs and the web table see the same
+    # column as a fresh search, without touching any existing values.
+    writer.ensure_columns(config.SEARCH_RESULTS_XLSX, SEARCH_COLS)
     wb = load_workbook(config.SEARCH_RESULTS_XLSX, read_only=True)
     ws = wb.active
     headers = [
@@ -354,6 +361,7 @@ def _load_search_results(required=True):
             "pmcid": d.get("pmcid") or "",
             "year": d.get("year") or "",
             "journal": d.get("journal") or "",
+            "publication_type": d.get("publication_type") or "",
             "abstract": d.get("abstract") or "",
             "is_oa": d.get("is_open_access") in ("yes", "true", True, 1),
             "fulltext_url": d.get("fulltext_url") or "",
@@ -412,6 +420,7 @@ def _closed_row(p, reason):
         "authors": p.get("authors", ""),
         "doi": p.get("doi", ""),
         "source": ", ".join(p.get("sources", [])),
+        "publication_type": p.get("publication_type", ""),
         "reason": reason,
     }
 

@@ -34,7 +34,8 @@ QUERIES = [
 #   "pubmed"    -> NCBI PubMed (E-utilities API)  — needs NCBI_EMAIL below
 #   "europepmc" -> Europe PMC (REST API)          — free, no key
 #   "crossref"  -> Crossref (REST API)            — free, no key; great for DOI metadata
-SOURCES = ["pubmed", "europepmc", "crossref"]
+#   "chemrxiv"  -> ChemRxiv preprints (via the Crossref API; marked "preprint")
+SOURCES = ["pubmed", "europepmc", "crossref", "chemrxiv"]
 
 # Safety cap: max results per query, per source. Raise/lower as you like.
 MAX_RESULTS_PER_QUERY = 50

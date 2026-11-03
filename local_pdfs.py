@@ -237,6 +237,7 @@ def _read_pdf_metadata(path):
         "pmcid": "",
         "year": year,
         "journal": "",
+        "publication_type": "local PDF",
         "is_oa": True,
         "fulltext_url": "",
         "local_pdf": "",

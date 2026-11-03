@@ -1,14 +1,17 @@
 """
-searchers.py — query PubMed, Europe PMC and Crossref, and merge the results.
+searchers.py — query PubMed, Europe PMC, Crossref and ChemRxiv, and merge results.
 
 Every source speaks the same boolean AND/OR/NOT syntax, so a single query string
-from config.QUERIES works across all of them. All three are public REST APIs.
+from config.QUERIES works across all of them. They are all public REST APIs.
+ChemRxiv is searched through Crossref's metadata for prefix 10.26434 because the
+official ChemRxiv API is protected by a Cloudflare browser challenge.
 
 Each result is a plain dict with these keys:
-    sources      (list of source names, e.g. ["pubmed", "europepmc"])
+    sources          (list of source names, e.g. ["pubmed", "europepmc"])
     title, authors, abstract, doi, pmid, pmcid, year, journal  (strings)
-    is_oa        (True/False/None — whether the source flagged it open access)
-    fulltext_url (an open-access full-text URL, if the source provided one)
+    publication_type ("journal article", "preprint" or "local PDF")
+    is_oa            (True/False/None — whether the source flagged it open access)
+    fulltext_url     (an open-access full-text URL, if the source provided one)
 """
 
 import re
@@ -23,6 +26,13 @@ ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 EUROPEPMC = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 CROSSREF = "https://api.crossref.org/works"
+
+# ChemRxiv DOI prefix. Crossref also exposes the records under this prefix, so
+# no request ever goes to chemrxiv.org (whose public API sits behind a
+# Cloudflare browser challenge). The prefix alone is not exclusive to ChemRxiv,
+# so results are post-filtered by DOI as well.
+CHEMRXIV_PREFIX = "10.26434"
+CHEMRXIV_DOI_MARKER = "chemrxiv"
 
 # Open ends for Europe PMC's PUB_YEAR range. Its query syntax needs both
 # endpoints even when the user only supplied one year.
@@ -107,7 +117,7 @@ def _merge_into(papers, incoming):
     existing = papers[key]
     for f in (
         "title", "authors", "abstract", "doi", "pmid", "pmcid", "year", "journal",
-        "local_pdf", "local_pdf_path", "local_pdf_original",
+        "publication_type", "local_pdf", "local_pdf_path", "local_pdf_original",
     ):
         if not existing.get(f) and incoming.get(f):
             existing[f] = incoming[f]
@@ -246,6 +256,7 @@ def _parse_pubmed_xml(xml_text):
             "pmcid": _pubmed_articleid(article, "pmc"),
             "year": _pubmed_year(article),
             "journal": _text_of(article.find(".//Article/Journal/Title")),
+            "publication_type": "journal article",
             "is_oa": None,
             "fulltext_url": "",
         })
@@ -377,6 +388,7 @@ def _europepmc_to_paper(rec):
         "pmcid": rec.get("pmcid", "") or "",
         "year": str(rec.get("pubYear", "") or ""),
         "journal": journal,
+        "publication_type": "journal article",
         "is_oa": is_oa if is_oa else None,
         "fulltext_url": fulltext_url,
     }
@@ -417,7 +429,107 @@ def search_crossref(query, limit=None, year_from=None, year_to=None):
     return papers[:limit]
 
 
-def _crossref_to_paper(it):
+def search_chemrxiv(query, limit=None, year_from=None, year_to=None):
+    """Search ChemRxiv postings through Crossref.
+
+    The official ChemRxiv API (chemrxiv.org/engage/chemrxiv/public-api/v1/items)
+    sits behind a Cloudflare browser challenge. Crossref carries the same
+    metadata under DOI prefix 10.26434, so this function only talks to
+    api.crossref.org. Crossref's ``from-posted-date`` / ``until-posted-date``
+    filters match the ``posted`` date used for preprints (not ``pub-date``).
+    """
+    year_from, year_to = normalize_year_range(year_from, year_to)
+    limit = limit or config.MAX_RESULTS_PER_QUERY
+
+    filters = [
+        "type:posted-content",
+        f"prefix:{CHEMRXIV_PREFIX}",
+    ]
+    if year_from:
+        filters.append(f"from-posted-date:{year_from}-01-01")
+    if year_to:
+        filters.append(f"until-posted-date:{year_to}-12-31")
+
+    params = {
+        "query": query,
+        "rows": str(min(limit, 1000)),
+        "filter": ",".join(filters),
+        "select": (
+            "DOI,title,author,abstract,published,container-title,link,type,"
+            "posted,publisher"
+        ),
+    }
+    mailto = str(config.NCBI_EMAIL or "").strip()
+    if mailto:
+        params["mailto"] = mailto
+
+    r = requests.get(CROSSREF, params=params, timeout=config.HTTP_TIMEOUT)
+    r.raise_for_status()
+    items = r.json().get("message", {}).get("items", [])
+
+    papers = []
+    for it in items:
+        # Prefix 10.26434 is shared by ChemRxiv and a few other posted-content
+        # records. Only keep DOIs that actually name ChemRxiv, and check this
+        # before mapping so no non-ChemRxiv DOI can leak into the results.
+        doi = str(it.get("DOI") or "").strip()
+        if CHEMRXIV_DOI_MARKER not in doi.lower():
+            continue
+        p = _crossref_to_paper(
+            it,
+            source="chemrxiv",
+            date_keys=("posted", "published"),
+            publication_type="preprint",
+            journal_fallback="ChemRxiv",
+            is_oa=True,
+            prefer_pdf_link=True,
+        )
+        if p:
+            papers.append(p)
+    return papers[:limit]
+
+
+def _crossref_date_year(it, date_keys):
+    """Return the first four-digit year found in the given date fields."""
+    for key in date_keys:
+        pub = it.get(key)
+        if isinstance(pub, dict) and pub.get("date-parts"):
+            parts = pub["date-parts"][0]
+            if parts and parts[0]:
+                return str(parts[0])
+    return ""
+
+
+def _crossref_link(it, prefer_pdf=False):
+    """Best link from a Crossref record, optionally preferring PDF locations."""
+    links = [
+        link for link in (it.get("link") or [])
+        if isinstance(link, dict) and link.get("URL")
+    ]
+    if prefer_pdf:
+        for link in links:
+            url = str(link["URL"])
+            content_type = str(link.get("content-type") or "").lower()
+            if "/pdf" in url.lower() or "pdf" in content_type:
+                return url
+    return links[0]["URL"] if links else ""
+
+
+def _crossref_to_paper(
+    it,
+    source="crossref",
+    date_keys=None,
+    publication_type="journal article",
+    journal_fallback="",
+    is_oa=None,
+    prefer_pdf_link=False,
+):
+    """Map one Crossref item to the shared paper dict.
+
+    Journal searches keep their historical defaults. ChemRxiv reuses this with
+    ``date_keys=("posted", "published")``, a preprint type, a journal fallback
+    and PDF-first link selection, which avoids duplicating the mapping.
+    """
     doi = it.get("DOI", "") or ""
     title_list = it.get("title") or []
     title = title_list[0] if title_list else ""
@@ -430,31 +542,22 @@ def _crossref_to_paper(it):
         if a.get("family")
     )
 
-    year = ""
-    for k in ("published", "published-print", "published-online"):
-        pub = it.get(k)
-        if isinstance(pub, dict) and pub.get("date-parts"):
-            dp = pub["date-parts"][0]
-            if dp and dp[0]:
-                year = str(dp[0])
-                break
+    if date_keys is None:
+        date_keys = ("published", "published-print", "published-online")
+    year = _crossref_date_year(it, date_keys)
 
     journal = ""
     ct = it.get("container-title") or []
     if ct:
         journal = ct[0]
+    if not journal:
+        journal = journal_fallback
 
     abstract = re.sub(r"<[^>]+>", " ", it.get("abstract", "") or "")
     abstract = re.sub(r"\s+", " ", abstract).strip()
 
-    fulltext_url = ""
-    for link in (it.get("link") or []):
-        if link.get("URL"):
-            fulltext_url = link["URL"]
-            break
-
     return {
-        "sources": ["crossref"],
+        "sources": [source],
         "title": title,
         "authors": authors,
         "abstract": abstract,
@@ -463,8 +566,9 @@ def _crossref_to_paper(it):
         "pmcid": "",
         "year": year,
         "journal": journal,
-        "is_oa": None,
-        "fulltext_url": fulltext_url,
+        "publication_type": publication_type,
+        "is_oa": is_oa,
+        "fulltext_url": _crossref_link(it, prefer_pdf=prefer_pdf_link),
     }
 
 
@@ -474,4 +578,5 @@ SOURCE_REGISTRY = {
     "pubmed":    {"label": "PubMed",     "fn": search_pubmed},
     "europepmc": {"label": "Europe PMC", "fn": search_europepmc},
     "crossref":  {"label": "Crossref",   "fn": search_crossref},
+    "chemrxiv":  {"label": "ChemRxiv",   "fn": search_chemrxiv},
 }
