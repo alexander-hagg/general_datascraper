@@ -153,6 +153,14 @@ EXTRACTED_XLSX      = OUTPUT_DIR / "extracted_data.xlsx"
 CHECKPOINT_JSON     = OUTPUT_DIR / "checkpoint.json"
 LOCAL_PDF_INDEX_JSON = OUTPUT_DIR / "local_pdfs.json"
 
+# Prompt history for the web app (searches, extraction goals and columns).
+# It is global across workspaces/browser sessions and git-ignored. Old entries
+# are dropped automatically: at most PROMPT_HISTORY_MAX_ENTRIES in total and
+# PROMPT_HISTORY_MAX_PER_KIND per kind, keeping the most recently used ones.
+PROMPT_HISTORY_JSON = OUTPUT_DIR / "prompt_history.json"
+PROMPT_HISTORY_MAX_ENTRIES = 100
+PROMPT_HISTORY_MAX_PER_KIND = 50
+
 # ==================== 5. WEB APP ====================
 
 # Run the local web app with:  python app.py   (or double-click start.bat)

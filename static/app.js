@@ -147,6 +147,173 @@ async function saveSettings() {
   }
 }
 
+/* ---------- prompt history ---------- */
+
+const HISTORY_KINDS = ["search", "goal", "columns"];
+const historyEntries = { search: [], goal: [], columns: [] };
+const HISTORY_PLACEHOLDERS = {
+  search: { empty: "No previous searches yet", choose: "Choose a previous search…" },
+  goal: { empty: "No previous goals yet", choose: "Choose a previous goal…" },
+  columns: { empty: "No previous columns yet", choose: "Choose previous columns…" },
+};
+
+function truncateHistoryText(text, max) {
+  if (text.length <= max) return text;
+  return text.slice(0, Math.max(0, max - 1)).replace(/\s+$/, "") + "…";
+}
+
+// Compact, accessible label for one stored prompt. Search entries show the
+// rendered query (or "(folder only)"), the other kinds their text.
+function historyOptionLabel(entry) {
+  const data = entry.data || {};
+  let text = "";
+  if (entry.kind === "search") {
+    text = String(data.query || "").replace(/\s+/g, " ").trim();
+    if (!text) text = "(folder only)";
+  } else {
+    text = String(data.text || "").replace(/\s+/g, " ").trim();
+  }
+  if (!text) text = "(empty)";
+  text = truncateHistoryText(text, 70);
+  const uses = Number(entry.uses) || 0;
+  return uses > 1 ? text + " (used " + uses + "×)" : text;
+}
+
+function renderHistorySelect(kind, entries) {
+  const select = document.getElementById("history-" + kind);
+  if (!select) return;
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  const labels = HISTORY_PLACEHOLDERS[kind];
+  placeholder.textContent = entries.length ? labels.choose : labels.empty;
+  select.innerHTML = "";
+  select.appendChild(placeholder);
+  entries.forEach(entry => {
+    const option = document.createElement("option");
+    option.value = String(entry.id || "");
+    option.textContent = historyOptionLabel(entry);
+    select.appendChild(option);
+  });
+  select.value = "";
+  select.disabled = entries.length === 0;
+  const clearBtn = document.getElementById("history-" + kind + "-clear");
+  if (clearBtn) clearBtn.disabled = entries.length === 0;
+}
+
+async function refreshHistory(kind) {
+  try {
+    const data = await getJSON("/api/history?kind=" + encodeURIComponent(kind));
+    if (Array.isArray(data.entries)) {
+      historyEntries[kind] = data.entries;
+      renderHistorySelect(kind, data.entries);
+    }
+  } catch (e) {
+    // History is optional; a failed refresh must not disturb the main UI.
+  }
+}
+
+async function loadHistory() {
+  await Promise.all(HISTORY_KINDS.map(refreshHistory));
+}
+
+function setFieldValue(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.value = value === null || value === undefined ? "" : String(value);
+}
+
+function flashBanner(message, type, ms) {
+  setBanner(message, type);
+  setTimeout(() => {
+    const banner = document.getElementById("banner");
+    if (banner && banner.textContent === message) setBanner("");
+  }, ms || 3000);
+}
+
+// Restore everything that belongs to a stored search. The search is
+// deliberately NOT started: the user can review the tree and press Search.
+function applySearchHistory(entry) {
+  const data = entry.data || {};
+  const tree = data.query_tree;
+  const usableTree = tree && typeof tree === "object" &&
+    (tree.type === "group" || tree.type === "term");
+  if (usableTree) {
+    queryModel.restore(tree);
+  } else {
+    // Legacy entries predate the query tree: put their rendered query into a
+    // single term rather than trying to parse boolean syntax in the browser.
+    queryModel.restore({ type: "group", op: "AND", children: [] });
+    const query = String(data.query || "").trim();
+    if (query) {
+      const first = queryModel.root.children[0];
+      if (first && first.type === "term") first.text = query;
+      else queryModel.addTerm(queryModel.root, query, "AND");
+    }
+  }
+  renderQuery();
+
+  if ("max_results" in data && data.max_results !== null && data.max_results !== "") {
+    setFieldValue("max-results", data.max_results);
+  }
+  if ("year_from" in data) setFieldValue("year-from", data.year_from || "");
+  if ("year_to" in data) setFieldValue("year-to", data.year_to || "");
+  if ("excluded_journals" in data) {
+    const journals = data.excluded_journals;
+    setFieldValue(
+      "excluded-journals",
+      Array.isArray(journals) ? journals.join("\n") : (journals || "")
+    );
+  }
+  if ("local_folder" in data) setFieldValue("local-folder", data.local_folder || "");
+  if ("local_recursive" in data) {
+    const recursive = document.getElementById("local-recursive");
+    if (recursive) recursive.checked = !!data.local_recursive;
+  }
+  if (Array.isArray(data.sources)) {
+    const wanted = new Set(data.sources.map(s => String(s)));
+    document.querySelectorAll("#source-list input[type=checkbox]").forEach(cb => {
+      cb.checked = wanted.has(cb.value);
+    });
+  }
+  flashBanner("Restored previous search. Click Search papers to run it.", "info", 3500);
+}
+
+function applyTextHistory(entry, targetId) {
+  const data = entry.data || {};
+  setFieldValue(targetId, data.text || "");
+}
+
+function bindHistorySelect(kind, onPick) {
+  const select = document.getElementById("history-" + kind);
+  if (!select) return;
+  select.addEventListener("change", () => {
+    const entry = historyEntries[kind].find(e => String(e.id) === select.value);
+    if (entry) onPick(entry);
+    select.value = "";
+  });
+}
+
+async function clearPromptHistory(kind) {
+  try {
+    const result = await postJSON("/api/history/clear", { kind });
+    await refreshHistory(kind);
+    const count = Number(result.cleared) || 0;
+    const label = kind === "search" ? "search" : kind;
+    flashBanner(
+      "Cleared " + count + " previous " + label +
+        (count === 1 ? " entry." : " entries."),
+      "ok",
+      2500
+    );
+  } catch (e) {
+    setBanner(e.message, "error");
+  }
+}
+
+function bindHistoryClear(kind) {
+  const btn = document.getElementById("history-" + kind + "-clear");
+  if (btn) btn.onclick = () => clearPromptHistory(kind);
+}
+
 /* ---------- query builder (nested boolean groups) ---------- */
 
 /*
@@ -176,6 +343,8 @@ async function saveSettings() {
  *   serialize()                -> the exact query string sent to /api/search
  *   quoteTerm(text)            -> quoting rule used by serialize()
  *   countTerms()               -> number of non-empty-agnostic term nodes
+ *   snapshot()                 -> JSON-safe tree without node ids (history)
+ *   restore(snapshot)          -> replace the tree from a stored snapshot
  */
 const queryModel = (function () {
   let nextId = 0;
@@ -320,6 +489,84 @@ const queryModel = (function () {
     return n;
   }
 
+  function safeOperator(op) {
+    return op === "OR" || op === "NOT" ? op : "AND";
+  }
+
+  // Plain JSON snapshot for the history store. Node ids are browser-only and
+  // are deliberately omitted so the server can deduplicate equivalent trees.
+  function snapshotNode(node) {
+    if (!node || typeof node !== "object") return null;
+    if (node.type === "term") {
+      return {
+        type: "term",
+        text: String(node.text || ""),
+        op: safeOperator(node.op),
+      };
+    }
+    if (node.type === "group") {
+      return {
+        type: "group",
+        op: safeOperator(node.op),
+        children: (Array.isArray(node.children) ? node.children : [])
+          .map(snapshotNode)
+          .filter(Boolean),
+      };
+    }
+    return null;
+  }
+
+  function snapshot() {
+    return {
+      type: "group",
+      op: "AND",
+      children: root.children.map(snapshotNode).filter(Boolean),
+    };
+  }
+
+  // Append one stored node below `parent`, creating fresh ids through
+  // addTerm/addGroup. Empty terms, empty groups and malformed objects are
+  // ignored; the caller guarantees at least one term afterwards.
+  function appendSnapshot(raw, parent) {
+    if (!raw || typeof raw !== "object") return false;
+    if (raw.type === "term") {
+      const text = typeof raw.text === "string" ? raw.text : "";
+      if (!text.trim()) return false;
+      addTerm(parent, text, safeOperator(raw.op));
+      return true;
+    }
+    if (raw.type !== "group") return false;
+    const group = addGroup(parent, safeOperator(raw.op));
+    let added = 0;
+    (Array.isArray(raw.children) ? raw.children : []).forEach(child => {
+      if (appendSnapshot(child, group)) added += 1;
+    });
+    if (!added) {
+      removeNode(group);
+      return false;
+    }
+    return true;
+  }
+
+  function restore(snapshotTree) {
+    root.children = [];
+    const snap = (snapshotTree && typeof snapshotTree === "object")
+      ? snapshotTree
+      : null;
+    const children = !snap
+      ? []
+      : (snap.type === "term" ? [snap] : (Array.isArray(snap.children) ? snap.children : []));
+    children.forEach(child => appendSnapshot(child, root));
+    if (root.children.length === 0) addTerm(root);
+    try {
+      if (typeof selectedIds !== "undefined") selectedIds.clear();
+      if (typeof childrenSelectedGroups !== "undefined") childrenSelectedGroups.clear();
+    } catch (e) {
+      // Selection state is not initialised (e.g. a DOM-free Node harness).
+    }
+    return root;
+  }
+
   return {
     root,
     findParent,
@@ -334,6 +581,8 @@ const queryModel = (function () {
     serialize,
     quoteTerm,
     countTerms,
+    snapshot,
+    restore,
   };
 })();
 
@@ -1030,6 +1279,7 @@ async function doSearch() {
   try {
     const { job_id } = await postJSON("/api/search", {
       query,
+      query_tree: queryModel.snapshot(),
       sources,
       max_results: maxResults,
       excluded_journals: document.getElementById("excluded-journals").value,
@@ -1119,6 +1369,7 @@ function pollJob(jobId) {
         showProgress(false);
         await loadResults();
         if (job.result && job.result.added !== undefined) {
+          await refreshHistory("search");
           const excluded = job.result.excluded || 0;
           const suffix = excluded ? ` (${excluded} excluded by journal)` : "";
           const years = formatYearRange(job.result.year_from, job.result.year_to);
@@ -1129,6 +1380,7 @@ function pollJob(jobId) {
             : "";
           setBanner(`Search finished: ${job.result.total} papers${rangeSuffix}${suffix}${localSuffix}.`, "ok");
         } else if (job.result && job.result.extracted !== undefined) {
+          await Promise.all([refreshHistory("goal"), refreshHistory("columns")]);
           const modeLabel = job.result.mode === "table" ? "table rows" : "individual records";
           setBanner(`Extraction finished (${modeLabel}): ${job.result.extracted} row(s) extracted, ${job.result.closed} paper(s) closed.`, "ok");
         }
@@ -1667,6 +1919,11 @@ document.getElementById("wrap-selected").onclick = wrapSelected;
 
 document.getElementById("suggest-all").onclick = suggestAllTerms;
 
+bindHistorySelect("search", applySearchHistory);
+bindHistorySelect("goal", entry => applyTextHistory(entry, "goal"));
+bindHistorySelect("columns", entry => applyTextHistory(entry, "columns"));
+HISTORY_KINDS.forEach(bindHistoryClear);
+
 window.addEventListener("DOMContentLoaded", async () => {
   bindNumericInputs();
   setupResultsTabs();
@@ -1676,6 +1933,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   try {
     await Promise.all([loadSources(), loadSettings()]);
   } catch (e) { /* non-fatal */ }
+  await loadHistory();
   await loadResults();
   await checkStatus();
 });

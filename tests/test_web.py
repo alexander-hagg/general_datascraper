@@ -1,5 +1,6 @@
 """Flask API tests: legacy results and extraction payload compatibility."""
 
+import contextlib
 import json
 import tempfile
 import unittest
@@ -154,6 +155,12 @@ class ExtractApiTests(unittest.TestCase):
 
 
 class ExtractJobMigrationTests(unittest.TestCase):
+    def setUp(self):
+        # Existing job tests must never write the real output/prompt_history.json.
+        patcher = mock.patch.object(web.history, "record")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_legacy_extracted_sheet_is_migrated_and_appended(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -251,10 +258,43 @@ class SearchApiJournalTests(unittest.TestCase):
         self.assertEqual(
             self.calls[0][2],
             ("A AND B", ["pubmed"], 5, ["Foo Journal", "Bar Journal"], None, None,
-             "", False),
+             "", False, None),
         )
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["excluded_journals"], ["Foo Journal", "Bar Journal"])
+
+    def test_query_tree_is_forwarded_to_the_search_job(self):
+        tree = {
+            "type": "group",
+            "op": "AND",
+            "children": [
+                {"type": "term", "text": "A", "op": "AND"},
+                {
+                    "type": "group",
+                    "op": "NOT",
+                    "children": [
+                        {"type": "term", "text": "C", "op": "AND"},
+                        {"type": "term", "text": "D", "op": "OR"},
+                    ],
+                },
+            ],
+        }
+        response = self._post({
+            "query": "A NOT (C OR D)",
+            "sources": ["pubmed"],
+            "query_tree": tree,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.calls[0][2][-1], tree)
+
+    def test_invalid_query_tree_does_not_fail_the_search(self):
+        response = self._post({
+            "query": "A",
+            "sources": ["pubmed"],
+            "query_tree": "not a tree",
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.calls), 1)
 
     def test_old_client_without_key_falls_back_to_saved_setting(self):
         self.settings_path.write_text(
@@ -268,7 +308,7 @@ class SearchApiJournalTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("A", ["crossref"], 3, ["Saved Journal"], None, None, "", False),
+            ("A", ["crossref"], 3, ["Saved Journal"], None, None, "", False, None),
         )
 
     def test_old_client_without_settings_falls_back_to_config(self):
@@ -281,7 +321,7 @@ class SearchApiJournalTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("A", ["europepmc"], 4, ["Configured Journal"], None, None, "", False),
+            ("A", ["europepmc"], 4, ["Configured Journal"], None, None, "", False, None),
         )
         self.assertFalse(self.settings_path.exists())
 
@@ -328,7 +368,7 @@ class LocalSearchApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("", [], 50, [], None, None, str(self.folder), True),
+            ("", [], 50, [], None, None, str(self.folder), True, None),
         )
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["local_folder"], str(self.folder))
@@ -344,7 +384,7 @@ class LocalSearchApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("", [], 50, [], None, None, str(self.folder), False),
+            ("", [], 50, [], None, None, str(self.folder), False, None),
         )
 
     def test_folder_only_flag_without_a_folder_gets_400(self):
@@ -409,7 +449,7 @@ class LocalSearchApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("A", ["pubmed"], 50, [], None, None, "", False),
+            ("A", ["pubmed"], 50, [], None, None, "", False, None),
         )
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["local_folder"], "")
@@ -424,7 +464,7 @@ class LocalSearchApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("A", ["pubmed"], 50, [], None, None, str(self.folder), True),
+            ("A", ["pubmed"], 50, [], None, None, str(self.folder), True, None),
         )
 
 
@@ -508,6 +548,11 @@ class SettingsApiJournalTests(unittest.TestCase):
 
 
 class SearchJobJournalTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(web.history, "record")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _job(self):
         return {
             "log": [],
@@ -596,6 +641,11 @@ class SearchJobJournalTests(unittest.TestCase):
 
 
 class SearchJobLocalTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(web.history, "record")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _job(self):
         return {
             "log": [],
@@ -751,6 +801,247 @@ class SearchJobLocalTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(index_path.read_text(encoding="utf-8")), {}
             )
+
+
+class HistoryApiTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.path = self.dir / "prompt_history.json"
+        self._path_patch = mock.patch.object(
+            web.config, "PROMPT_HISTORY_JSON", self.path
+        )
+        self._path_patch.start()
+        self.addCleanup(self._path_patch.stop)
+        self.client = web.app.test_client()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_history_lists_all_and_filtered_by_kind(self):
+        search = web.history.record("search", {
+            "query": "A AND B",
+            "query_tree": {
+                "type": "group", "op": "AND",
+                "children": [{"type": "term", "text": "A", "op": "AND"}],
+            },
+        })
+        goal = web.history.record("goal", {"text": "Find mutations"})
+
+        payload = self.client.get("/api/history").get_json()
+        self.assertEqual([e["id"] for e in payload["entries"]], [goal["id"], search["id"]])
+
+        filtered = self.client.get("/api/history?kind=search").get_json()
+        self.assertEqual([e["kind"] for e in filtered["entries"]], ["search"])
+        self.assertEqual(filtered["entries"][0]["data"]["query"], "A AND B")
+
+    def test_history_rejects_an_unknown_kind(self):
+        response = self.client.get("/api/history?kind=bogus")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("history kind", response.get_json()["error"])
+
+        response = self.client.post("/api/history/clear", json={"kind": "bogus"})
+        self.assertEqual(response.status_code, 400)
+        response = self.client.post("/api/history/clear", json={"kind": 3})
+        self.assertEqual(response.status_code, 400)
+
+    def test_history_clear_one_kind_or_all(self):
+        web.history.record("search", {"query": "A"})
+        web.history.record("goal", {"text": "B"})
+        web.history.record("columns", {"text": "C"})
+
+        response = self.client.post("/api/history/clear", json={"kind": "goal"})
+        self.assertEqual(response.get_json(), {"cleared": 1})
+        self.assertEqual(len(self.client.get("/api/history").get_json()["entries"]), 2)
+
+        response = self.client.post("/api/history/clear", json={})
+        self.assertEqual(response.get_json(), {"cleared": 2})
+        self.assertEqual(self.client.get("/api/history").get_json()["entries"], [])
+
+    def test_history_file_is_not_exposed_by_download_routes(self):
+        web.history.record("goal", {"text": "Private prompt"})
+        self.assertTrue(self.path.exists())
+        response = self.client.get("/download/prompt_history.json")
+        self.assertEqual(response.status_code, 404)
+
+
+class SearchJobHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.path = self.dir / "prompt_history.json"
+        self._path_patch = mock.patch.object(
+            web.config, "PROMPT_HISTORY_JSON", self.path
+        )
+        self._path_patch.start()
+        self.addCleanup(self._path_patch.stop)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _job(self):
+        return {
+            "log": [],
+            "progress": {"done": 0, "total": 0, "current": ""},
+            "result": None,
+            "status": "running",
+            "error": None,
+        }
+
+    def _run(self, query_tree=None, fail_history=False):
+        folder = self.dir / "pdfs"
+        folder.mkdir(exist_ok=True)
+        stats = {
+            "folder": str(folder), "recursive": True, "found": 0,
+            "scanned": 0, "copied": 0, "linked": 0, "skipped": 0,
+            "duplicates": 0, "errors": 0, "error_details": [], "papers": 0,
+        }
+        job = self._job()
+        patches = [
+            mock.patch.object(web.config, "SEARCH_RESULTS_XLSX", self.dir / "search.xlsx"),
+            mock.patch.object(web.config, "EXTRACTED_XLSX", self.dir / "extracted.xlsx"),
+            mock.patch.object(web.config, "CLOSED_SOURCE_XLSX", self.dir / "closed.xlsx"),
+            mock.patch.object(web.config, "CHECKPOINT_JSON", self.dir / "checkpoint.json"),
+            mock.patch.object(
+                web.config, "LOCAL_PDF_INDEX_JSON", self.dir / "local_pdfs.json"
+            ),
+            mock.patch.object(web, "apply_settings", lambda s: None),
+            mock.patch.object(web, "load_settings", lambda: {}),
+            mock.patch.object(
+                web.local_pdfs, "scan_folder",
+                lambda folder, recursive=False: ([], stats),
+            ),
+            mock.patch.object(
+                web.searchers, "search",
+                lambda query, sources, limit=None, year_from=None, year_to=None: [],
+            ),
+        ]
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            if fail_history:
+                stack.enter_context(
+                    mock.patch.object(
+                        web.history, "record",
+                        side_effect=RuntimeError("history disk is full"),
+                    )
+                )
+            web._run_search_job(
+                job, "  A AND B  ", ["pubmed"], 12,
+                ["Blocked Journal"], "2015", "2020", str(folder), True,
+                query_tree,
+            )
+        return job
+
+    def test_search_job_records_the_normalized_prompt(self):
+        tree = {
+            "type": "group",
+            "op": "AND",
+            "children": [
+                {"type": "term", "text": "A", "op": "AND"},
+                {"type": "term", "text": "B", "op": "AND"},
+                {
+                    "type": "group",
+                    "op": "NOT",
+                    "children": [
+                        {"type": "term", "text": "C", "op": "AND"},
+                        {"type": "term", "text": "D", "op": "OR"},
+                    ],
+                },
+            ],
+        }
+        job = self._run(query_tree=tree)
+        self.assertEqual(job["status"], "done")
+
+        entries = web.history.list_entries("search")
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["data"], {
+            "query": "A AND B",
+            "query_tree": tree,
+            "sources": ["pubmed"],
+            "max_results": 12,
+            "year_from": "2015",
+            "year_to": "2020",
+            "excluded_journals": ["Blocked Journal"],
+            "local_folder": str(self.dir / "pdfs"),
+            "local_recursive": True,
+        })
+        # No credentials or backend settings are stored.
+        for secret in ("email", "model", "api_key", "openai_base_url"):
+            self.assertNotIn(secret, entries[0]["data"])
+
+    def test_history_failure_does_not_break_the_search(self):
+        job = self._run(fail_history=True)
+        self.assertEqual(job["status"], "done")
+        self.assertIn(
+            "Warning: Could not save search prompt history",
+            "\n".join(job["log"]),
+        )
+        self.assertFalse(self.path.exists())
+
+
+class ExtractJobHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "prompt_history.json"
+        self._path_patch = mock.patch.object(
+            web.config, "PROMPT_HISTORY_JSON", self.path
+        )
+        self._path_patch.start()
+        self.addCleanup(self._path_patch.stop)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _job(self):
+        return {
+            "log": [],
+            "progress": {"done": 0, "total": 0, "current": ""},
+            "result": None,
+            "status": "running",
+            "error": None,
+        }
+
+    def _run(self, goal, columns, fail_history=False):
+        job = self._job()
+        with mock.patch.object(web, "apply_settings", lambda s: None), \
+             mock.patch.object(web, "load_settings", lambda: {}), \
+             mock.patch.object(web, "_load_search_results", lambda required=False: []):
+            if fail_history:
+                with mock.patch.object(
+                    web.history, "record",
+                    side_effect=RuntimeError("history disk is full"),
+                ):
+                    web._run_extract_job(job, goal, columns, mode="records")
+            else:
+                web._run_extract_job(job, goal, columns, mode="records")
+        return job
+
+    def test_extract_job_records_goal_and_non_empty_columns(self):
+        job = self._run("Find mutations", ["mutation", "effect"])
+        self.assertEqual(job["status"], "done")
+
+        goals = web.history.list_entries("goal")
+        self.assertEqual([e["data"]["text"] for e in goals], ["Find mutations"])
+        columns = web.history.list_entries("columns")
+        self.assertEqual(
+            [e["data"]["text"] for e in columns], ["mutation, effect"]
+        )
+
+    def test_extract_job_without_columns_records_only_the_goal(self):
+        job = self._run("Find mutations", [])
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(len(web.history.list_entries("goal")), 1)
+        self.assertEqual(web.history.list_entries("columns"), [])
+
+    def test_history_failure_does_not_break_extraction(self):
+        job = self._run("Find mutations", ["mutation"], fail_history=True)
+        self.assertEqual(job["status"], "done")
+        self.assertIn(
+            "Warning: Could not save goal prompt history",
+            "\n".join(job["log"]),
+        )
+        self.assertFalse(self.path.exists())
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ import config
 import extractor
 import fetcher
 import filters
+import history
 import local_pdfs
 import searchers
 import suggester
@@ -199,13 +200,29 @@ def _paper_to_row(p):
     return paper_to_row(p)
 
 
+def _record_history(job, kind, data):
+    """Record a prompt without ever failing the running job.
+
+    History is a convenience feature: a corrupt file, a full disk or an
+    unexpected value must not stop a search or an extraction run.
+    """
+    try:
+        return history.record(kind, data)
+    except Exception as exc:  # noqa: BLE001 - history is best-effort
+        message = f"Could not save {kind} prompt history: {exc}"
+        app.logger.warning(message)
+        job["log"].append(f"Warning: {message}")
+        return None
+
+
 _YEARS_UNSET = object()
 _LOCAL_UNSET = object()
 
 
 def _run_search_job(job, query, sources, max_results, excluded_journals=None,
                     year_from=_YEARS_UNSET, year_to=_YEARS_UNSET,
-                    local_folder=_LOCAL_UNSET, local_recursive=_LOCAL_UNSET):
+                    local_folder=_LOCAL_UNSET, local_recursive=_LOCAL_UNSET,
+                    query_tree=None):
     try:
         settings = load_settings()
         apply_settings(settings)
@@ -265,6 +282,21 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None,
             )
         if terms:
             job["log"].append("Journal blocklist: " + ", ".join(terms))
+
+        # Save the normalized prompt after every check above and before any
+        # folder scan or network call. Only prompt/search fields are stored;
+        # email, API keys and model settings never enter the history file.
+        _record_history(job, "search", {
+            "query": query,
+            "query_tree": query_tree,
+            "sources": sources,
+            "max_results": max_results,
+            "year_from": year_from,
+            "year_to": year_to,
+            "excluded_journals": terms,
+            "local_folder": local_folder,
+            "local_recursive": local_recursive,
+        })
 
         # Scan inside the job so a large folder reports progress instead of
         # blocking the request. Invalid folders are also rejected by /api/search.
@@ -372,6 +404,13 @@ def _run_extract_job(job, goal, columns, mode="records"):
         field_names = [f[0] for f in fields]
         instruction = make_instruction(goal, mode=mode)
         extract_cols = extract_columns(field_names)
+
+        # Inputs are valid at this point. Record them before touching the
+        # spreadsheet/checkpoint so even a run with no papers leaves a prompt
+        # the user can pick again.
+        _record_history(job, "goal", {"text": goal})
+        if columns:
+            _record_history(job, "columns", {"text": ", ".join(columns)})
 
         job["log"].append(f"Extraction mode: {mode}")
 
@@ -610,6 +649,39 @@ def api_settings():
     return jsonify(load_settings())
 
 
+@app.route("/api/history")
+def api_history():
+    """Return prompt history, newest-used first.
+
+    `?kind=search|goal|columns` filters to one kind. Invalid values are
+    rejected instead of silently returning the whole store.
+    """
+    kind = request.args.get("kind")
+    if kind is not None:
+        kind = kind.strip()
+        if kind not in history.KINDS:
+            return jsonify({
+                "error": "Unknown history kind. Use search, goal or columns."
+            }), 400
+    return jsonify({"entries": history.list_entries(kind)})
+
+
+@app.route("/api/history/clear", methods=["POST"])
+def api_history_clear():
+    """Clear all history, or only one kind when `kind` is supplied."""
+    data = request.get_json(force=True, silent=True) or {}
+    if not isinstance(data, dict):
+        data = {}
+    kind = data.get("kind")
+    if kind is not None:
+        if not isinstance(kind, str) or kind.strip() not in history.KINDS:
+            return jsonify({
+                "error": "Unknown history kind. Use search, goal or columns."
+            }), 400
+        kind = kind.strip()
+    return jsonify({"cleared": history.clear(kind)})
+
+
 @app.route("/api/search", methods=["POST"])
 def api_search():
     data = request.get_json(force=True, silent=True) or {}
@@ -696,6 +768,7 @@ def api_search():
     job, err = _start_job(
         "search", _run_search_job, query, sources, max_results,
         excluded_journals, year_from, year_to, local_folder, local_recursive,
+        data.get("query_tree"),
     )
     if err:
         return jsonify({"error": err}), 409

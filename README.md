@@ -364,6 +364,33 @@ send the affected search term(s) to the LLM backend configured in `config.py`
 an OpenAI-compatible endpoint sends them to that provider. Nothing else is sent,
 and neither feature changes the search or extraction pipeline.
 
+## Prompt history
+
+The web app remembers what you typed, so you do not have to rebuild a search
+from scratch:
+
+- **Previous searches** (top of the Search card) restores the complete nested
+  query tree and the related search settings: max results, publication years,
+  excluded journals, local PDF folder/subfolders, and the checked websites. The
+  search is **not** run automatically — review it, then click **Search papers**.
+- **Previous goals** and **Previous columns** (Extract card) fill only the goal
+  box or the column-name box; they do not start an extraction.
+
+Each list has a small **Clear** button. History is global: it is shared by every
+workspace/browser session that uses the same ScrapeLite folder, never stored in
+the browser. Repeated prompts are deduplicated (shown with `used N×`), and the
+most recently used entries are kept first.
+
+The store is a single local file, `output/prompt_history.json`, which is
+git-ignored. It contains only prompt/search text and settings (never your email,
+API key, or model credentials). Space is capped automatically: 100 entries in
+total and 50 per kind (searches, goals, columns). You can change the caps in
+`config.py` with `PROMPT_HISTORY_MAX_ENTRIES` and
+`PROMPT_HISTORY_MAX_PER_KIND`; setting a cap lower than the current number of
+entries trims the oldest used ones on the next saved prompt. Deleting the file
+also clears the history and is always safe.
+
+
 ## PDF archiving & preprint fallback
 
 During the **Extract** step (never during Search), ScrapeLite also downloads and

@@ -95,6 +95,21 @@ input[type="text"], input[type="number"], textarea {
 input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
 textarea { resize: vertical; }
 
+/* Prompt history rows (previous searches/goals/columns) */
+.history-row {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  margin: 6px 0 8px;
+}
+.history-label {
+  flex: none; font-size: 0.85rem; font-weight: 600; color: var(--ink);
+}
+.history-row .field-label { margin: 0; flex: none; }
+.history-select {
+  flex: 1 1 240px; min-width: 0; max-width: 100%;
+  padding: 7px 8px; font-size: 0.86rem;
+}
+.history-row .ghost-btn.mini { flex: none; }
+
 /* Query builder */
 .query-builder { margin-bottom: 10px; }
 .term-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; }
