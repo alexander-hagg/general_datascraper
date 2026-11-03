@@ -29,11 +29,14 @@ That's it. The Excel files are the output; the browser is just the control panel
 The results area has two tabs:
 
 - **Search & Extract** (the default) shows the papers that were found.
-- **Data & PDFs** appears as soon as there are extracted rows. It groups those
-  rows by paper, so you can see at a glance which paper each row came from.
-  Each group shows the paper title, journal, year and how many rows belong to
-  it; the rows themselves are listed underneath. Rows whose paper cannot be
-  identified are collected in a clearly labelled **Unlinked rows** group.
+- **Data & PDFs** appears as soon as there are extracted rows (or detected
+  figures). It groups those rows by paper, so you can see at a glance which
+  paper each row came from. Each group shows the paper title, journal, year and
+  how many rows belong to it; the rows themselves are listed underneath. Rows
+  whose paper cannot be identified are collected in a clearly labelled
+  **Unlinked rows** group. A full-width **Figures** gallery below the table
+  shows the screenshots ScrapeLite detected in the archived PDFs (see
+  **Figures & tables** below).
 
 Click any data row to select it. The panel on the right shows the paper
 metadata, the **verbatim evidence quote** for that row, its 1-based page and
@@ -481,23 +484,75 @@ embedded highlights, so the quote panel is always the fallback.
 
 For API/script users, `GET /api/results` keeps its existing `search`,
 `extracted` and `closed` keys and adds an `annotations` mapping keyed by
-`paper_key`. Each entry contains `available`, `pdf_file`, `pdf_source`, `title`
-and the `evidence` status list. `GET /api/annotated-pdf/<paper_key>` serves the
-cached annotation, regenerates it on demand from the index if the file is
-missing, or serves the original archived PDF when no quote resolved. Unknown
-keys and unsafe paths return 404; the index itself and arbitrary files are
-never exposed.
+`paper_key` plus a `figures` list. Each annotation entry contains `available`,
+`pdf_file`, `pdf_source`, `title` and the `evidence` status list.
+`GET /api/annotated-pdf/<paper_key>` serves the cached annotation, regenerates
+it on demand from the index if the file is missing, or serves the original
+archived PDF when no quote resolved. Unknown keys and unsafe paths return 404;
+the index itself and arbitrary files are never exposed.
 
 `output/pdf_index.json` and `output/annotated_pdfs/` are git-ignored. The page
 numbers are text-layer pages only: **there is no OCR**, so scanned/image-only
 PDFs leave quotes unresolved even though their extracted data is kept.
+
+## Figures & tables
+
+During **Extract**, every paper with an archived PDF is also scanned with
+PyMuPDF for figures and tables. This works for online papers and for local PDFs
+alike, runs even when `EVIDENCE_ENABLED = False`, and never fails an extraction:
+a broken PDF or missing PyMuPDF only produces a warning in the job log.
+
+The detector:
+
+1. finds text blocks that start with `Figure`, `Fig.` or `Table` (including
+   forms such as `Figure 1`, `Fig. 2B` and `Table S3A`) and keeps the full
+   caption (up to about 1,000 characters) plus a clean label such as
+   `Figure 1` or `Table 2A`;
+2. crops the nearby image/vector drawing when one exists; otherwise it takes a
+   band above the caption for a lower-half figure, or below it for a typical
+   table caption. If that crop is too small, it saves the whole page so the
+   caption still gets a visual;
+3. on pages with no caption, saves sufficiently large embedded images (small
+   icons and logos are skipped) with labels like `Image p.3`.
+
+Each screenshot is rendered at `FIGURE_DPI` (default `150`) and written as a
+PNG under `output/figures/<safe-paper-stem>/`. Duplicate crops are reused by
+their content hash, and `FIGURE_MAX_PER_PAPER` (default `50`) caps one paper;
+the job log reports when the cap was hit. The index is
+`output/figures/index.json` (relative paths only) and the same metadata is
+written to `output/figures.xlsx`.
+
+The **Data & PDFs** tab shows the results as a thumbnail gallery grouped by
+paper. Each thumbnail shows the label, page and a short caption; click it to
+open a full-size lightbox with the complete caption, paper title and an
+**Open image in new tab** link. The **⬇ figures.xlsx** button appears only when
+figures exist.
+
+A **web Search replaces the dataset**, so it also clears the figure index,
+`figures.xlsx` and cached PNGs to prevent stale thumbnails from the previous
+search. A **CLI search merges** into the existing sheet and therefore preserves
+all existing figures.
+
+For API/script users:
+
+- `GET /api/figures[?paper_key=...]` lists indexed figures whose PNG exists;
+- `GET /api/figure/<figure_id>` serves that PNG inline (`image/png`). Only ids
+  present in the index are accepted and their relative paths are validated
+  under `output/figures/`; unknown, missing or unsafe ids return 404;
+- `GET /download/figures.xlsx` downloads the spreadsheet when it exists.
+
+Limitations: this is **PDF only** — there is no HTML/PMC figure download and
+**no OCR**, so a scanned page without a text caption produces no caption crop
+(its page may still be indexed if a caption block exists). `output/figures/`
+and `output/figures.xlsx` are git-ignored. Figure detection is controlled by
+`FIGURES_ENABLED`, `FIGURE_DPI` and `FIGURE_MAX_PER_PAPER` in `config.py`.
 
 ## Requirements
 
 - Windows 10/11 (macOS/Linux also work if you run `python app.py` directly)
 - Python 3.10+ (installed automatically by `setup.bat` via winget if missing)
 - [Ollama](https://ollama.com) (installed automatically by `setup.bat` if missing)
-- PyMuPDF for evidence page numbers and annotated PDFs (installed from
-  `requirements.txt` by the setup script; extraction still works with a warning
-  if it is unavailable)
+- PyMuPDF for evidence page numbers, annotated PDFs and figure screenshots
+  (installed from `requirements.txt` by the setup script; extraction still
+  works with a warning if it is unavailable)
 - ~8 GB free disk for the model, plus a few GB of RAM to run it

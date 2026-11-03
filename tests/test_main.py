@@ -423,9 +423,13 @@ class RunExtractEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             extracted, closed, checkpoint = self._paths(tmp)
+            fig_dir = tmp / "figures"
             with mock.patch.object(main.config, "EXTRACTED_XLSX", extracted), \
                  mock.patch.object(main.config, "CLOSED_SOURCE_XLSX", closed), \
                  mock.patch.object(main.config, "CHECKPOINT_JSON", checkpoint), \
+                 mock.patch.object(main.config, "FIGURES_DIR", fig_dir), \
+                 mock.patch.object(main.config, "FIGURES_INDEX_JSON", fig_dir / "index.json"), \
+                 mock.patch.object(main.config, "FIGURES_XLSX", tmp / "figures.xlsx"), \
                  mock.patch.object(main.extractor, "check_backend", lambda: None), \
                  mock.patch.object(
                      main,

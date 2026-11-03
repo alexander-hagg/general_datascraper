@@ -27,6 +27,7 @@ from openpyxl import load_workbook
 import config
 import extractor
 import fetcher
+import figures
 import filters
 import local_pdfs
 import pdf_annotations
@@ -506,6 +507,24 @@ def run_extract(limit=None, papers=None, mode="records"):
                     print(f"  -> {message}")
             except Exception as exc:  # noqa: BLE001 - evidence is best-effort
                 print(f"  !! evidence warning: {exc}")
+
+        # Detect figure/table screenshots in the archived PDF. Independent of
+        # evidence and of the number of extracted rows: the gallery is useful
+        # even when the model returned zero records. Never fatal.
+        if getattr(config, "FIGURES_ENABLED", True) and pdf.get("path"):
+            try:
+                figure_summary = figures.process_paper(
+                    pdf.get("path"),
+                    paper_identity(p),
+                    title=p.get("title", ""),
+                    pdf_file=pdf_file,
+                    pdf_source=pdf_source,
+                )
+                message = figures.summary_message(figure_summary)
+                if message:
+                    print(f"  -> {message}")
+            except Exception as exc:  # noqa: BLE001 - figures are best-effort
+                print(f"  !! figure warning: {exc}")
 
         writer.append_xlsx(config.EXTRACTED_XLSX, EXTRACT_COLS, out_rows)
 

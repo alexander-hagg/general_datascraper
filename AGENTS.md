@@ -36,7 +36,9 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   `MAX_LOCAL_PDFS`), LLM backend, `FIELDS` (drives the generated
   JSON schema/prompt), PDF archiving, evidence/annotation settings
   (`EVIDENCE_ENABLED`, `EVIDENCE_MAX_CHARS`, `EVIDENCE_FUZZY_THRESHOLD`,
-  `PDF_INDEX_JSON`, `ANNOTATED_PDF_DIR`), prompt-history path/caps, output
+  `PDF_INDEX_JSON`, `ANNOTATED_PDF_DIR`), figure settings
+  (`FIGURES_ENABLED`, `FIGURE_DPI`, `FIGURE_MAX_PER_PAPER`, `FIGURES_DIR`,
+  `FIGURES_INDEX_JSON`, `FIGURES_XLSX`), prompt-history path/caps, output
   paths, Flask host/port. The web Settings panel persists
   email/model/max-results/year range/local folder to
   `output/web_settings.json`; those values **override `config.py` at app
@@ -82,6 +84,18 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   raises. `load_index()`, `api_summary()`, `resolve_paper_paths()` and
   `regenerate_annotation()` are the safe read/serve helpers (they reject
   absolute paths, `..` and escapes outside `PDF_DIR` / `ANNOTATED_PDF_DIR`).
+- `figures.py`: PDF-only figure/table detection during Extract. Uses
+  `page.get_text("dict")` caption blocks (`^(figure|fig.?|table)\s*S?\d+[A-Za-z]?\b`),
+  prefers nearby image/drawing rects, then a vertical band above/below the
+  caption, then a full-page fallback (`kind` `caption`/`image`/`page`). Renders
+  PNGs at `FIGURE_DPI` under `FIGURES_DIR/<safe-paper-stem>/`, dedupes by
+  SHA-256 of paper_key + page + kind + PNG bytes, caps at
+  `FIGURE_MAX_PER_PAPER`, and writes `output/figures/index.json`
+  (`{"version":1,"figures":[...]}`) plus `output/figures.xlsx`. All operations
+  are best-effort and never raise into extraction. `process_paper()` replaces
+  only that paper's index entries; `clear()` (web search only) removes the
+  index, xlsx and cached PNG dirs. The index stores POSIX relative paths only;
+  `resolve_figure_path()`/`api_list()` validate them under `FIGURES_DIR`.
 - `extractor.py`: Ollama path constrains output with the JSON schema and expects a
   bare array; OpenAI JSON mode requires the `{"items": [...]}` object wrapper.
   Both shapes plus fenced/prose fallbacks are handled in `_parse_response`.
@@ -95,8 +109,11 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   `GET /api/annotated-pdf/<path:paper_key>` serves only keys in
   `output/pdf_index.json`, regenerating a missing annotation or falling back to
   the original PDF; unknown/invalid keys are 404. `GET /api/results` keeps
-  `{search, extracted, closed}` and adds the API-safe `annotations` mapping.
-  `/download` exposes only the three Excel files.
+  `{search, extracted, closed}` and adds the API-safe `annotations` mapping plus
+  the `figures` list. `GET /api/figures[?paper_key=]` lists indexed figures and
+  `GET /api/figure/<figure_id>` serves only ids in the figure index, resolving
+  their relative paths under `FIGURES_DIR`; unknown/unsafe/missing ids are 404.
+  `/download` exposes only the four Excel files (including `figures.xlsx`).
 - `static/app.js` + `templates/index.html`: vanilla JS query builder, no bundler.
   `/api/autocomplete` proxies PubMed suggestions to avoid browser CORS;
   `/api/suggest` uses the LLM through `suggester.py`. The Data & PDFs tab keeps
@@ -104,6 +121,10 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   the right (`iframe#pdf-viewer`, annotations metadata by `row_index`, page
   anchor, "Open in new tab"); mobile stacks the pane below the table. The quote
   panel is the fallback because browser PDF viewers vary in highlight support.
+  A full-width `#figures-section` below `.data-layout` renders `data.figures`
+  as paper-grouped lazy thumbnails (`/api/figure/<id>`) with a no-dependency
+  lightbox (backdrop/Escape/close, label, page, caption, new-tab link); the
+  section and `figures.xlsx` buttons are hidden when the list is empty.
 
 ## Behavior that is easy to break
 
@@ -114,7 +135,8 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   The local index follows the same rule: the web job always writes it with
   `replace=True` (stale mappings cannot survive a replaced dataset), while a CLI
   run that scans `--local-folder` writes the final merged set so retained papers
-  keep their mappings.
+  keep their mappings. The figure index follows it too: web search clears it
+  (`figures.clear()`), CLI search preserves it.
 - **Local PDFs are a separate source and skip the online PDF path:**
   `_prepare_paper()` uses the archived local file directly, reports
   `source="local"` / `label="local:folder"`, and never calls
@@ -133,6 +155,22 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   resolves, so the viewer can show the original. The index/annotations store
   basenames only; never add an API/serving path that accepts a caller-supplied
   filename. There is **no OCR**: image-only PDFs leave quotes unresolved.
+- **Figure detection is independent, best-effort and PDF-only:** both
+  `main.run_extract()` and `app._run_extract_job()` call
+  `figures.process_paper()` whenever `FIGURES_ENABLED` and `pdf.get("path")`
+  exist — after the annotation block, before/around the Excel write, even when
+  `EVIDENCE_ENABLED = False` and even when the model returned zero records. A
+  failure only logs `figure warning`; extraction continues. Figures apply to
+  local PDFs too (they have archived paths). Web search calls `figures.clear()`
+  when it replaces the dataset (index + `figures.xlsx` + cached PNG dirs);
+  CLI search merges and must never clear them. `process_paper()` replaces only
+  that paper's index entries, so re-extraction cannot leave stale figures.
+  Detection uses captions plus nearby image/drawing rects, a caption band or a
+  full-page fallback (`kind` `caption`/`image`/`page`), then large embedded
+  images on uncaptioned pages. It is **PDF-only**, with **no OCR** and no
+  HTML/PMC figure download. Index paths are POSIX relative names validated
+  under `FIGURES_DIR`; never accept a caller-supplied path. Orphan PNGs from
+  older versions may remain, but only index entries are served.
 - **Web folder-only search:** `/api/search` allows an empty query and no sources
   only when a valid `local_folder` is supplied. Supplying a query without sources
   (or sources without a query) is still a 400. Omitted `local_folder` /
@@ -177,7 +215,8 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   `local_pdfs.json` (local mapping, git-ignored), `prompt_history.json`
   (global web prompt history, git-ignored), `pdfs/`, `pdf_index.json`
   (evidence/annotation index, git-ignored), `annotated_pdfs/` (cached
-  highlighted copies, git-ignored).
+  highlighted copies, git-ignored), `figures/` (figure index + cached PNGs,
+  git-ignored), `figures.xlsx` (figure metadata, covered by `output/*.xlsx`).
 
 ## Repository gotchas
 

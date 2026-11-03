@@ -161,6 +161,7 @@
           <button class="ghost-btn" id="dl-search" onclick="downloadFile('search_results.xlsx')">⬇ search_results.xlsx</button>
           <button class="ghost-btn" id="dl-extracted" onclick="downloadFile('extracted_data.xlsx')">⬇ extracted_data.xlsx</button>
           <button class="ghost-btn" id="dl-closed" onclick="downloadFile('closed_source_papers.xlsx')">⬇ closed_source_papers.xlsx</button>
+          <button class="ghost-btn hidden" id="dl-figures" onclick="downloadFile('figures.xlsx')">⬇ figures.xlsx</button>
         </div>
       </div>
 
@@ -213,8 +214,39 @@
             </div>
           </aside>
         </div>
+
+        <section id="figures-section" class="figures-section hidden" aria-labelledby="figures-heading">
+          <div class="figures-head">
+            <h3 class="subhead" id="figures-heading">Figures <span id="figures-count" class="muted"></span></h3>
+            <button class="ghost-btn mini" id="dl-figures-gallery"
+                    onclick="downloadFile('figures.xlsx')">⬇ figures.xlsx</button>
+          </div>
+          <p class="hint figures-hint">Screenshots detected in the archived PDFs.
+            Captions and page numbers come from the PDF; image-only papers are not OCR'd.</p>
+          <div id="figures-gallery" class="figures-gallery"></div>
+        </section>
       </div>
     </section>
+
+    <div id="figure-modal" class="figure-modal hidden" role="dialog" aria-modal="true"
+         aria-labelledby="figure-modal-title">
+      <div class="figure-modal-backdrop" data-close-figure></div>
+      <div class="figure-modal-panel" role="document">
+        <button type="button" class="figure-modal-close" id="figure-modal-close"
+                aria-label="Close figure">×</button>
+        <div class="figure-modal-image-wrap">
+          <img id="figure-modal-image" alt="">
+        </div>
+        <div class="figure-modal-body">
+          <p id="figure-modal-label" class="figure-modal-label"></p>
+          <p id="figure-modal-title" class="figure-modal-title"></p>
+          <p id="figure-modal-meta" class="figure-modal-meta"></p>
+          <p id="figure-modal-caption" class="figure-modal-caption"></p>
+          <a id="figure-modal-link" class="figure-modal-link" href="#" target="_blank"
+             rel="noopener">Open image in new tab ↗</a>
+        </div>
+      </div>
+    </div>
 
     <details class="card settings">
       <summary>Settings</summary>
