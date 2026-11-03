@@ -116,6 +116,8 @@ async function loadSettings() {
   document.getElementById("max-results").value = s.max_results || 50;
   document.getElementById("year-from").value = s.year_from || "";
   document.getElementById("year-to").value = s.year_to || "";
+  document.getElementById("local-folder").value = s.local_folder || "";
+  document.getElementById("local-recursive").checked = !!s.local_recursive;
   const journals = s.excluded_journals;
   document.getElementById("excluded-journals").value =
     Array.isArray(journals) ? journals.join("\n") : (journals || "");
@@ -132,6 +134,8 @@ async function saveSettings() {
       excluded_journals: document.getElementById("excluded-journals").value,
       year_from: years.year_from,
       year_to: years.year_to,
+      local_folder: document.getElementById("local-folder").value.trim(),
+      local_recursive: document.getElementById("local-recursive").checked,
     };
     await postJSON("/api/settings", body);
     document.getElementById("max-results").value = body.max_results;
@@ -1003,9 +1007,25 @@ async function doSearch() {
   const sources = [...document.querySelectorAll("#source-list input:checked")].map(c => c.value);
   const maxResults = parseInt(document.getElementById("max-results").value, 10) || 50;
   const years = readYearRange();
-  if (!query) { setBanner("Enter at least one search term.", "error"); return; }
-  if (!sources.length) { setBanner("Choose at least one website.", "error"); return; }
+  const localFolder = document.getElementById("local-folder").value.trim();
+  const localRecursive = document.getElementById("local-recursive").checked;
+  const localOnly = !!localFolder && !query && !sources.length;
   if (years.error) { setBanner(years.error, "error"); return; }
+  if (localFolder) {
+    // With a folder, an empty query + no websites means folder-only. Mixing
+    // one without the other is ambiguous, so say exactly what to fix.
+    if (query && !sources.length) {
+      setBanner("Choose at least one website, or clear the search terms for a folder-only search.", "error");
+      return;
+    }
+    if (!query && sources.length) {
+      setBanner("Enter at least one search term, or deselect every website for a folder-only search.", "error");
+      return;
+    }
+  } else {
+    if (!query) { setBanner("Enter at least one search term.", "error"); return; }
+    if (!sources.length) { setBanner("Choose at least one website.", "error"); return; }
+  }
 
   try {
     const { job_id } = await postJSON("/api/search", {
@@ -1015,6 +1035,9 @@ async function doSearch() {
       excluded_journals: document.getElementById("excluded-journals").value,
       year_from: years.year_from,
       year_to: years.year_to,
+      local_folder: localFolder,
+      local_recursive: localRecursive,
+      local_only: localOnly,
     });
     setBusy(true);
     showProgress(true);
@@ -1100,7 +1123,11 @@ function pollJob(jobId) {
           const suffix = excluded ? ` (${excluded} excluded by journal)` : "";
           const years = formatYearRange(job.result.year_from, job.result.year_to);
           const rangeSuffix = years ? ` (years ${years})` : "";
-          setBanner(`Search finished: ${job.result.total} papers${rangeSuffix}${suffix}.`, "ok");
+          const localCount = job.result.local_count || 0;
+          const localSuffix = job.result.local_folder
+            ? `, ${localCount} local PDF${localCount === 1 ? "" : "s"}`
+            : "";
+          setBanner(`Search finished: ${job.result.total} papers${rangeSuffix}${suffix}${localSuffix}.`, "ok");
         } else if (job.result && job.result.extracted !== undefined) {
           const modeLabel = job.result.mode === "table" ? "table rows" : "individual records";
           setBanner(`Extraction finished (${modeLabel}): ${job.result.extracted} row(s) extracted, ${job.result.closed} paper(s) closed.`, "ok");

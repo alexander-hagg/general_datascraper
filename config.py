@@ -135,12 +135,23 @@ FIELDS = [
 PDF_ARCHIVE_ENABLED = True
 PDF_DIR = OUTPUT_DIR / "pdfs"
 
+# Optional: a folder of PDFs you already have on this computer. Use it from the
+# web Search card, or from the CLI with --local-folder PATH. PDFs are copied
+# (or hardlinked) into PDF_DIR so extraction stays self-contained.
+#   LOCAL_PDF_DIR       default folder shown in the web app ("" = none)
+#   LOCAL_PDF_RECURSIVE default for the "Include subfolders" checkbox
+#   MAX_LOCAL_PDFS      safety cap; a larger folder is rejected with a clear error
+LOCAL_PDF_DIR = ""
+LOCAL_PDF_RECURSIVE = False
+MAX_LOCAL_PDFS = 500
+
 # ==================== 5. OUTPUT FILES (you usually won't change these) ====================
 
 SEARCH_RESULTS_XLSX = OUTPUT_DIR / "search_results.xlsx"
 CLOSED_SOURCE_XLSX  = OUTPUT_DIR / "closed_source_papers.xlsx"
 EXTRACTED_XLSX      = OUTPUT_DIR / "extracted_data.xlsx"
 CHECKPOINT_JSON     = OUTPUT_DIR / "checkpoint.json"
+LOCAL_PDF_INDEX_JSON = OUTPUT_DIR / "local_pdfs.json"
 
 # ==================== 5. WEB APP ====================
 

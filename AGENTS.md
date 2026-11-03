@@ -12,7 +12,10 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
 - CLI: `.venv/bin/python main.py` (search + extract)
   - `--search-only`, `--extract-only` (needs existing `output/search_results.xlsx`),
     `--limit N`, `--reset` (clears `output/checkpoint.json`),
-    `--year-from YYYY` / `--year-to YYYY` (optional publication-year range).
+    `--year-from YYYY` / `--year-to YYYY` (optional publication-year range),
+    `--local-folder PATH`, `--recursive`, `--local-only` (folder-only; requires
+    `--local-folder`). `--extract-only` relies on `output/local_pdfs.json` and
+    never rescans the source folder.
 - Setup: `bash setup.sh`; all setup/start scripts support `--dry-run`.
 - Windows equivalents: `setup.bat` / `start.bat` (wrappers around `setup.ps1`).
   When changing setup/start behavior or dry-run output, keep `setup.sh`,
@@ -29,10 +32,19 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
 ## Architecture
 
 - `config.py` is the single settings source: queries, sources, `YEAR_FROM` /
-  `YEAR_TO`, LLM backend, `FIELDS` (drives the generated JSON schema/prompt),
-  PDF archiving, output paths, Flask host/port. The web Settings panel persists
-  email/model/max-results/year range to `output/web_settings.json`; those values
-  **override `config.py` at app startup**.
+  `YEAR_TO`, local-PDF defaults (`LOCAL_PDF_DIR`, `LOCAL_PDF_RECURSIVE`,
+  `MAX_LOCAL_PDFS`), LLM backend, `FIELDS` (drives the generated
+  JSON schema/prompt), PDF archiving, output paths, Flask host/port. The web
+  Settings panel persists email/model/max-results/year range/local folder to
+  `output/web_settings.json`; those values **override `config.py` at app
+  startup**.
+- `local_pdfs.py`: local folder source. `scan_folder()` validates the folder,
+  reads pypdf metadata plus a DOI from the first three pages, dedupes by DOI then
+  normalized title, and copies/hardlinks each valid `%PDF-` into `config.PDF_DIR`
+  as `local_<path-hash>_<stem>.pdf`. `merge_local_papers()` matches online rows
+  by normalized DOI then title. `output/local_pdfs.json` maps `paper_key` to the
+  archived filename; `attach_to_papers()` re-attaches it when loading
+  `search_results.xlsx` (missing files are ignored).
 - `searchers.py`: API clients + `SOURCE_REGISTRY`. To add a source, implement
   `search_<name>(query, limit=None, year_from=None, year_to=None)` returning
   paper dicts and add one registry entry; the UI and `/api/sources` list it
@@ -63,6 +75,23 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   existing `search_results.xlsx`; web search replaces the sheet and also deletes
   `extracted_data.xlsx` + `closed_source_papers.xlsx` and resets the checkpoint
   (a fresh dataset). Don't align them without deciding which behavior is wanted.
+  The local index follows the same rule: the web job always writes it with
+  `replace=True` (stale mappings cannot survive a replaced dataset), while a CLI
+  run that scans `--local-folder` writes the final merged set so retained papers
+  keep their mappings.
+- **Local PDFs are a separate source and skip the online PDF path:**
+  `_prepare_paper()` uses the archived local file directly, reports
+  `source="local"` / `label="local:folder"`, and never calls
+  `fetcher.fetch_full_text()` or `pdf_fetcher.acquire_pdf()`. If the file has no
+  extractable text it returns no text (no fallback to another PDF), so the normal
+  closed flow records `PDF saved but no extractable text`. A missing indexed file
+  falls back to the normal online path. Local PDFs are not filtered by
+  `--year-from`/`--year-to`; the range only affects the online search.
+- **Web folder-only search:** `/api/search` allows an empty query and no sources
+  only when a valid `local_folder` is supplied. Supplying a query without sources
+  (or sources without a query) is still a 400. Omitted `local_folder` /
+  `local_recursive` keys fall back to saved settings; an explicitly blank folder
+  disables local PDFs. Settings are validated only at search time.
 - Checkpoint skips `extracted` and `closed` papers; `error` entries retry.
   Web search resets it, CLI only with `--reset`.
 - **The year range is separate from the boolean query:** it is never
@@ -83,7 +112,8 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   appended to `closed_source_papers.xlsx` with
   `PDF unavailable — download manually`; keep these reason strings stable.
 - Output files: `search_results.xlsx`, `extracted_data.xlsx` (appended),
-  `closed_source_papers.xlsx` (appended), `checkpoint.json`, `pdfs/`.
+  `closed_source_papers.xlsx` (appended), `checkpoint.json`,
+  `local_pdfs.json` (local mapping, git-ignored), `pdfs/`.
 
 ## Repository gotchas
 
