@@ -2,7 +2,7 @@
 
 ScrapeLite: a local search → open-access full-text fetch → LLM extraction pipeline.
 Flask UI + CLI share one Python engine; results go to Excel files in `output/`.
-No build step, package metadata, test suite, linter, or CI.
+No build step, package metadata, linter, or CI; unit tests live in `tests/`.
 
 ## Commands (Linux/macOS)
 
@@ -11,12 +11,14 @@ No build step, package metadata, test suite, linter, or CI.
   (`start.sh` runs `setup.sh` automatically if the venv is missing).
 - CLI: `.venv/bin/python main.py` (search + extract)
   - `--search-only`, `--extract-only` (needs existing `output/search_results.xlsx`),
-    `--limit N`, `--reset` (clears `output/checkpoint.json`).
+    `--limit N`, `--reset` (clears `output/checkpoint.json`),
+    `--year-from YYYY` / `--year-to YYYY` (optional publication-year range).
 - Setup: `bash setup.sh`; all setup/start scripts support `--dry-run`.
 - Windows equivalents: `setup.bat` / `start.bat` (wrappers around `setup.ps1`).
   When changing setup/start behavior or dry-run output, keep `setup.sh`,
   `setup.ps1`, `start.sh`, and `start.bat` in sync.
-- No tests. Smoke check: `.venv/bin/python -c "import app, main"`.
+- Tests: `.venv/bin/python -m unittest discover -s tests -v` (mocked, no network).
+  Smoke check: `.venv/bin/python -c "import app, main, searchers"`.
   `main.py --search-only` and any extraction/suggestions hit live services
   (PubMed/Europe PMC/Crossref, Ollama or the OpenAI-compatible endpoint).
 - Extraction and ✨ suggestions require Ollama running with the configured model
@@ -26,13 +28,17 @@ No build step, package metadata, test suite, linter, or CI.
 
 ## Architecture
 
-- `config.py` is the single settings source: queries, sources, LLM backend,
-  `FIELDS` (drives the generated JSON schema/prompt), PDF archiving, output paths,
-  Flask host/port. The web Settings panel persists email/model/max-results to
-  `output/web_settings.json`; those values **override `config.py` at app startup**.
+- `config.py` is the single settings source: queries, sources, `YEAR_FROM` /
+  `YEAR_TO`, LLM backend, `FIELDS` (drives the generated JSON schema/prompt),
+  PDF archiving, output paths, Flask host/port. The web Settings panel persists
+  email/model/max-results/year range to `output/web_settings.json`; those values
+  **override `config.py` at app startup**.
 - `searchers.py`: API clients + `SOURCE_REGISTRY`. To add a source, implement
-  `search_<name>(query, limit=None)` returning paper dicts and add one registry
-  entry; the UI and `/api/sources` list it automatically. Dedup key is
+  `search_<name>(query, limit=None, year_from=None, year_to=None)` returning
+  paper dicts and add one registry entry; the UI and `/api/sources` list it
+  automatically. `normalize_year_range()` is the shared validator: it returns
+  4-digit strings or `None` for open ends and rejects bools, non-4-digit values
+  and `from > to` with `ValueError`. Dedup key is
   PMID > lowercased DOI > lowercased title (`paper_key`).
 - `fetcher.py`: full text via PMC XML → source-provided OA URL → Unpaywall;
   rejects bodies under 500 chars.
@@ -59,6 +65,15 @@ No build step, package metadata, test suite, linter, or CI.
   (a fresh dataset). Don't align them without deciding which behavior is wanted.
 - Checkpoint skips `extracted` and `closed` papers; `error` entries retry.
   Web search resets it, CLI only with `--reset`.
+- **The year range is separate from the boolean query:** it is never
+  concatenated into the Query preview or the string passed as `query`. In
+  `/api/search`, an omitted `year_from`/`year_to` falls back to saved settings
+  then `config.py`; an explicitly blank side means an open end. Source mapping:
+  PubMed `datetype=pdat` + `mindate`/`maxdate`; Europe PMC
+  `PUB_YEAR:[from TO to]` (open ends `1000`/`3000`); Crossref
+  `from-pub-date:YYYY-01-01` / `until-pub-date:YYYY-12-31` appended to the
+  `type:journal-article` filter. Source clients validate direct calls;
+  `search()`/`search_all()` validate once up front.
 - Web Extract lets the user supply columns, which override `config.FIELDS` for
   that run (all treated as text). If the column header changes, the app starts a
   fresh `extracted_data.xlsx`; the CLI always uses `config.FIELDS`/`INSTRUCTION`.

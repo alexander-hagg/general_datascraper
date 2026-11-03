@@ -250,7 +250,7 @@ class SearchApiJournalTests(unittest.TestCase):
         self.assertEqual(self.calls[0][0], "search")
         self.assertEqual(
             self.calls[0][2],
-            ("A AND B", ["pubmed"], 5, ["Foo Journal", "Bar Journal"]),
+            ("A AND B", ["pubmed"], 5, ["Foo Journal", "Bar Journal"], None, None),
         )
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["excluded_journals"], ["Foo Journal", "Bar Journal"])
@@ -267,7 +267,7 @@ class SearchApiJournalTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("A", ["crossref"], 3, ["Saved Journal"]),
+            ("A", ["crossref"], 3, ["Saved Journal"], None, None),
         )
 
     def test_old_client_without_settings_falls_back_to_config(self):
@@ -280,7 +280,7 @@ class SearchApiJournalTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("A", ["europepmc"], 4, ["Configured Journal"]),
+            ("A", ["europepmc"], 4, ["Configured Journal"], None, None),
         )
         self.assertFalse(self.settings_path.exists())
 
@@ -361,7 +361,8 @@ class SearchJobJournalTests(unittest.TestCase):
                  mock.patch.object(web, "load_settings", lambda: {}), \
                  mock.patch.object(
                      web.searchers, "search",
-                     lambda query, sources, limit=None: list(papers),
+                     lambda query, sources, limit=None, year_from=None, year_to=None:
+                         list(papers),
                  ):
                 web._run_search_job(
                     job, "A", ["pubmed"], 10, ["predatory journal of examples"]
@@ -401,7 +402,8 @@ class SearchJobJournalTests(unittest.TestCase):
                  ), \
                  mock.patch.object(
                      web.searchers, "search",
-                     lambda query, sources, limit=None: list(papers),
+                     lambda query, sources, limit=None, year_from=None, year_to=None:
+                         list(papers),
                  ):
                 web._run_search_job(job, "A", ["pubmed"], 10)
 

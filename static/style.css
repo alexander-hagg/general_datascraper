@@ -216,6 +216,11 @@ select {
 .row { display: flex; gap: 20px; flex-wrap: wrap; }
 .col { flex: 1; min-width: 220px; }
 .col-narrow { flex: 0 0 160px; }
+.col-years { flex: 0 0 250px; }
+.year-range { display: flex; gap: 10px; }
+.year-field { flex: 1 1 0; min-width: 0; }
+.year-label { display: block; font-size: 0.78rem; color: var(--muted); margin-bottom: 4px; }
+.year-hint { margin: 6px 0 0; font-size: 0.8rem; }
 
 .checkbox-group { display: flex; gap: 16px; flex-wrap: wrap; padding: 8px 0; }
 .checkbox-group label { display: flex; align-items: center; gap: 6px; font-size: 0.92rem; cursor: pointer; }
@@ -358,7 +363,7 @@ td.oa-no { color: var(--muted); }
 }
 
 @media (max-width: 640px) {
-  .col-narrow { flex: 1 1 100%; }
+  .col-narrow, .col-years { flex: 1 1 100%; }
   .results-actions { flex-direction: column; }
 }
 

@@ -60,6 +60,14 @@ SETTINGS_PATH = config.OUTPUT_DIR / "web_settings.json"
 
 
 def _default_settings():
+    raw_from = getattr(config, "YEAR_FROM", None)
+    raw_to = getattr(config, "YEAR_TO", None)
+    try:
+        year_from, year_to = searchers.normalize_year_range(raw_from, raw_to)
+    except ValueError:
+        # A typo in config.py should not stop the web app from starting. Keep
+        # the bad values visible so the search endpoint can report them.
+        year_from, year_to = raw_from, raw_to
     return {
         "email": config.NCBI_EMAIL,
         "model": config.OLLAMA_MODEL,
@@ -67,6 +75,8 @@ def _default_settings():
         "excluded_journals": filters.parse_journal_terms(
             getattr(config, "EXCLUDED_JOURNALS", [])
         ),
+        "year_from": year_from,
+        "year_to": year_to,
     }
 
 
@@ -79,6 +89,15 @@ def load_settings():
             d["excluded_journals"] = filters.parse_journal_terms(
                 d.get("excluded_journals")
             )
+            try:
+                d["year_from"], d["year_to"] = searchers.normalize_year_range(
+                    d.get("year_from"), d.get("year_to")
+                )
+            except ValueError:
+                # Keep the other saved settings; only fall back for the bad range.
+                defaults = _default_settings()
+                d["year_from"] = defaults["year_from"]
+                d["year_to"] = defaults["year_to"]
             return d
         except Exception:
             return _default_settings()
@@ -93,6 +112,13 @@ def apply_settings(s):
     config.NCBI_EMAIL = s.get("email") or config.NCBI_EMAIL
     config.OLLAMA_MODEL = s.get("model") or config.OLLAMA_MODEL
     config.HTTP_HEADERS = {"User-Agent": f"general-datascraper/1.0 (mailto:{config.NCBI_EMAIL})"}
+    if "year_from" in s or "year_to" in s:
+        try:
+            config.YEAR_FROM, config.YEAR_TO = searchers.normalize_year_range(
+                s.get("year_from"), s.get("year_to")
+            )
+        except ValueError:
+            pass  # keep the config values; the search request will report the error
 
 
 apply_settings(load_settings())
@@ -157,22 +183,46 @@ def _paper_to_row(p):
     return paper_to_row(p)
 
 
-def _run_search_job(job, query, sources, max_results, excluded_journals=None):
+_YEARS_UNSET = object()
+
+
+def _run_search_job(job, query, sources, max_results, excluded_journals=None,
+                    year_from=_YEARS_UNSET, year_to=_YEARS_UNSET):
     try:
-        apply_settings(load_settings())
+        settings = load_settings()
+        apply_settings(settings)
         # Old callers/clients may not pass a blocklist: fall back to the saved
         # web setting, which itself defaults to config.EXCLUDED_JOURNALS.
         if excluded_journals is None:
-            excluded_journals = load_settings().get("excluded_journals")
+            excluded_journals = settings.get("excluded_journals")
+        # Both bounds omitted means "use the saved setting". The API always
+        # passes both values (possibly normalized None/None after the user
+        # cleared the boxes), and an explicit None is an open end, not a
+        # request to reuse the saved range.
+        if year_from is _YEARS_UNSET and year_to is _YEARS_UNSET:
+            year_from = settings.get("year_from")
+            year_to = settings.get("year_to")
+        else:
+            if year_from is _YEARS_UNSET:
+                year_from = None
+            if year_to is _YEARS_UNSET:
+                year_to = None
+        year_from, year_to = searchers.normalize_year_range(year_from, year_to)
+        range_label = searchers.year_range_label(year_from, year_to)
+
         terms = filters.parse_journal_terms(excluded_journals)
         job["log"].append(f"Query: {query}")
         job["log"].append(f"Websites: {', '.join(sources)}")
+        job["log"].append(f"Publication years: {range_label or 'all years'}")
         if terms:
             job["log"].append("Journal blocklist: " + ", ".join(terms))
         # A new search starts a fresh dataset: replace the search sheet AND clear
         # any previous extraction outputs + resume state, so Extract only ever
         # works on this search's papers.
-        papers = searchers.search(query, sources, limit=max_results)
+        papers = searchers.search(
+            query, sources, limit=max_results,
+            year_from=year_from, year_to=year_to,
+        )
         papers, excluded = filters.filter_papers(papers, terms)
         rows = [_paper_to_row(p) for p in papers]
         writer.write_xlsx(config.SEARCH_RESULTS_XLSX, SEARCH_COLS, rows)
@@ -185,12 +235,16 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None):
             "added": len(rows),
             "total": len(rows),
             "excluded": len(excluded),
+            "year_from": year_from,
+            "year_to": year_to,
+            "year_range": range_label or "all years",
         }
         job["status"] = "done"
         job["log"].append(f"Excluded {len(excluded)} paper(s) by journal blocklist.")
+        year_note = f"; years {range_label}" if range_label else ""
         job["log"].append(
             f"Done: {len(rows)} papers in the sheet "
-            f"({len(excluded)} excluded by journal; previous data cleared)."
+            f"({len(excluded)} excluded by journal{year_note}; previous data cleared)."
         )
     except Exception as e:
         job["status"] = "error"
@@ -442,6 +496,19 @@ def api_settings():
             s["excluded_journals"] = filters.parse_journal_terms(
                 data["excluded_journals"]
             )
+        if "year_from" in data or "year_to" in data:
+            candidate_from = (
+                data["year_from"] if "year_from" in data else s.get("year_from")
+            )
+            candidate_to = (
+                data["year_to"] if "year_to" in data else s.get("year_to")
+            )
+            try:
+                s["year_from"], s["year_to"] = searchers.normalize_year_range(
+                    candidate_from, candidate_to
+                )
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
         save_settings(s)
         apply_settings(s)
         return jsonify(s)
@@ -471,16 +538,39 @@ def api_search():
         settings.get("excluded_journals") if raw_journals is None else raw_journals
     )
 
+    # The year range is a separate request parameter, never part of `query`.
+    # Old clients omit both keys and fall back to saved settings (which default
+    # to config.YEAR_FROM/YEAR_TO). Presence of either key makes the request
+    # explicit; a blank side then means "no limit", not "use the saved year".
+    raw_years = "year_from" in data or "year_to" in data
+    if raw_years:
+        requested_from, requested_to = data.get("year_from"), data.get("year_to")
+    else:
+        requested_from, requested_to = (
+            settings.get("year_from"), settings.get("year_to")
+        )
+    try:
+        year_from, year_to = searchers.normalize_year_range(
+            requested_from, requested_to
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
     job, err = _start_job(
-        "search", _run_search_job, query, sources, max_results, excluded_journals
+        "search", _run_search_job, query, sources, max_results,
+        excluded_journals, year_from, year_to,
     )
     if err:
         return jsonify({"error": err}), 409
-    # A search is an implicit save for the blocklist: the user should not have
-    # to click "Save settings" for the exclusion they just typed to be used
-    # again next time.
-    if raw_journals is not None:
-        settings["excluded_journals"] = excluded_journals
+    # A search is an implicit save for the blocklist and an explicitly supplied
+    # year range: the user should not have to click "Save settings" for values
+    # they just typed to be used again next time.
+    if raw_journals is not None or raw_years:
+        if raw_journals is not None:
+            settings["excluded_journals"] = excluded_journals
+        if raw_years:
+            settings["year_from"] = year_from
+            settings["year_to"] = year_to
         save_settings(settings)
     return jsonify({"job_id": job["id"]})
 

@@ -6,6 +6,7 @@ main.py — run the whole pipeline, or just one stage.
     python main.py --extract-only  only fetch + extract (reads search_results.xlsx)
     python main.py --limit 5       extract at most 5 papers (quick demo)
     python main.py --mode table    one output row per row of a results table
+    python main.py --year-from 2015 --year-to 2024   limit publication years
     python main.py --reset         clear the resume checkpoint, then run
 
 See README.md for the full picture.
@@ -239,9 +240,20 @@ def build_extract_rows(paper, records, field_names, pdf_file="", pdf_source="non
     return rows
 
 
-def run_search():
+def run_search(year_from=None, year_to=None):
+    # Omitted CLI/API values fall back to config.py. An explicit blank string
+    # ("") still means "no limit on this side" and overrides a configured year.
+    if year_from is None:
+        year_from = getattr(config, "YEAR_FROM", None)
+    if year_to is None:
+        year_to = getattr(config, "YEAR_TO", None)
+    year_from, year_to = searchers.normalize_year_range(year_from, year_to)
+    range_label = searchers.year_range_label(year_from, year_to)
+
     print("== Step 1/2: searching ==")
-    new_papers = searchers.search_all()
+    if range_label:
+        print(f"Publication years: {range_label}")
+    new_papers = searchers.search_all(year_from=year_from, year_to=year_to)
 
     # Load any papers already in search_results.xlsx so a fresh search ADDS
     # to them (deduped) instead of wiping previous rows. If you want a totally
@@ -416,19 +428,45 @@ def run_extract(limit=None, papers=None, mode="records"):
     print(f"\nDone. See {config.EXTRACTED_XLSX} and {config.CLOSED_SOURCE_XLSX}.")
 
 
-def parse_args():
+def _year_arg(value):
+    """Argparse type for one optional four-digit publication year."""
+    if value is None:
+        return None
+    if not str(value).strip():
+        return ""
+    try:
+        return searchers.normalize_year_range(value, None)[0]
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+
+
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="Generalized search -> extract pipeline.")
     ap.add_argument("--search-only", action="store_true", help="only search (skip extraction)")
     ap.add_argument("--extract-only", action="store_true", help="only fetch + extract from existing search results")
     ap.add_argument("--limit", type=int, default=None, help="max papers to extract (quick demo)")
     ap.add_argument("--reset", action="store_true", help="clear the resume checkpoint before running")
     ap.add_argument(
+        "--year-from",
+        type=_year_arg,
+        default=None,
+        metavar="YYYY",
+        help="earliest publication year (default: config.YEAR_FROM)",
+    )
+    ap.add_argument(
+        "--year-to",
+        type=_year_arg,
+        default=None,
+        metavar="YYYY",
+        help="latest publication year (default: config.YEAR_TO)",
+    )
+    ap.add_argument(
         "--mode",
         choices=EXTRACTION_MODES,
         default=getattr(config, "EXTRACTION_MODE", "records"),
         help="extraction mode: individual records (default) or table rows",
     )
-    return ap.parse_args()
+    return ap.parse_args(argv)
 
 
 def main():
@@ -439,10 +477,14 @@ def main():
 
     if args.extract_only:
         run_extract(limit=args.limit, mode=args.mode)
-    elif args.search_only:
-        run_search()
-    else:
-        papers = run_search()
+        return
+
+    try:
+        papers = run_search(year_from=args.year_from, year_to=args.year_to)
+    except ValueError as e:
+        sys.exit(f"Error: {e}")
+
+    if not args.search_only:
         run_extract(limit=args.limit, papers=papers, mode=args.mode)
 
 

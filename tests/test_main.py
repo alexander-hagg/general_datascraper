@@ -102,7 +102,10 @@ class SearchIdentityTests(unittest.TestCase):
             "fulltext_url": "",
         }
         with mock.patch.object(main.config, "SEARCH_RESULTS_XLSX", path), \
-             mock.patch.object(main.searchers, "search_all", lambda: [paper]), \
+             mock.patch.object(
+                 main.searchers, "search_all",
+                 lambda limit=None, year_from=None, year_to=None: [paper],
+             ), \
              mock.patch.object(main, "_load_search_results", lambda required=False: []):
             main.run_search()
 
@@ -137,7 +140,10 @@ class JournalFilterSearchTests(unittest.TestCase):
             with mock.patch.object(main.config, "SEARCH_RESULTS_XLSX", search), \
                  mock.patch.object(main.config, "EXCLUDED_JOURNALS",
                                    ["predatory journal of examples"]), \
-                 mock.patch.object(main.searchers, "search_all", lambda: new_papers), \
+                 mock.patch.object(
+                     main.searchers, "search_all",
+                     lambda limit=None, year_from=None, year_to=None: new_papers,
+                 ), \
                  contextlib.redirect_stdout(output):
                 papers = main.run_search()
 
@@ -164,7 +170,10 @@ class JournalFilterSearchTests(unittest.TestCase):
             output = io.StringIO()
             with mock.patch.object(main.config, "SEARCH_RESULTS_XLSX", search), \
                  mock.patch.object(main.config, "EXCLUDED_JOURNALS", []), \
-                 mock.patch.object(main.searchers, "search_all", lambda: [paper]), \
+                 mock.patch.object(
+                     main.searchers, "search_all",
+                     lambda limit=None, year_from=None, year_to=None: [paper],
+                 ), \
                  mock.patch.object(main, "_load_search_results", lambda required=False: []), \
                  contextlib.redirect_stdout(output):
                 papers = main.run_search()

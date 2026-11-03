@@ -24,6 +24,57 @@ EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 EUROPEPMC = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 CROSSREF = "https://api.crossref.org/works"
 
+# Open ends for Europe PMC's PUB_YEAR range. Its query syntax needs both
+# endpoints even when the user only supplied one year.
+EUROPEPMC_MIN_YEAR = "1000"
+EUROPEPMC_MAX_YEAR = "3000"
+
+
+def _normalize_year(value):
+    """Return one optional publication year as a 4-digit string or None."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("Year must be a four-digit number.")
+    if isinstance(value, int):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+    else:
+        raise ValueError("Year must be a four-digit number.")
+
+    if not re.fullmatch(r"[0-9]{4}", text):
+        raise ValueError("Year must be a four-digit number.")
+    return text
+
+
+def normalize_year_range(year_from=None, year_to=None):
+    """Validate a publication-year range.
+
+    Accepts None, blank strings, integers and 4-digit strings. Returns
+    `(year_from, year_to)` as 4-digit strings (or None for an open end).
+    Bools and non-4-digit values are rejected, as is an inverted range.
+    """
+    start = _normalize_year(year_from)
+    end = _normalize_year(year_to)
+    if start is not None and end is not None and int(start) > int(end):
+        raise ValueError("Start year must not be after end year.")
+    return start, end
+
+
+def year_range_label(year_from=None, year_to=None):
+    """Human-readable label for a normalized range ('' means all years)."""
+    start, end = normalize_year_range(year_from, year_to)
+    if start and end:
+        return f"{start}-{end}"
+    if start:
+        return f"{start} onwards"
+    if end:
+        return f"up to {end}"
+    return ""
+
 
 def paper_key(paper):
     """Dedup key: PMID if present, else DOI (lowercased), else title."""
@@ -66,20 +117,26 @@ def merge_papers(existing, incoming):
     return list(papers.values())
 
 
-def search(query, sources, limit=None):
+def search(query, sources, limit=None, year_from=None, year_to=None):
     """Search ONE query across the given sources. Returns a merged, deduped list.
 
     Used by the web app (the UI sends a query string + a list of source names).
+    `year_from`/`year_to` are validated once here and forwarded to each source.
     """
+    year_from, year_to = normalize_year_range(year_from, year_to)
+    range_note = year_range_label(year_from, year_to)
     papers = {}
     for source in sources:
         entry = SOURCE_REGISTRY.get(source)
         if entry is None:
             print(f"  !! unknown source '{source}' (valid: {', '.join(SOURCE_REGISTRY)}) - skipping")
             continue
-        print(f"  searching {source}: {query[:60]}{'...' if len(query) > 60 else ''}")
+        suffix = f" [years {range_note}]" if range_note else ""
+        print(f"  searching {source}: {query[:60]}{'...' if len(query) > 60 else ''}{suffix}")
         try:
-            results = entry["fn"](query, limit=limit)
+            results = entry["fn"](
+                query, limit=limit, year_from=year_from, year_to=year_to
+            )
         except Exception as e:
             print(f"  !! {source} query failed: {e}")
             continue
@@ -88,11 +145,14 @@ def search(query, sources, limit=None):
     return list(papers.values())
 
 
-def search_all(limit=None):
+def search_all(limit=None, year_from=None, year_to=None):
     """CLI helper: run every config.SOURCES x config.QUERIES, merge and dedup."""
+    year_from, year_to = normalize_year_range(year_from, year_to)
     papers = {}
     for q in config.QUERIES:
-        for p in search(q, config.SOURCES, limit=limit):
+        for p in search(
+            q, config.SOURCES, limit=limit, year_from=year_from, year_to=year_to
+        ):
             _merge_into(papers, p)
     return list(papers.values())
 
@@ -108,12 +168,23 @@ def _pubmed_params(**extra):
     return p
 
 
-def search_pubmed(query, limit=None):
+def search_pubmed(query, limit=None, year_from=None, year_to=None):
+    year_from, year_to = normalize_year_range(year_from, year_to)
     limit = limit or config.MAX_RESULTS_PER_QUERY
 
-    params = _pubmed_params(
-        db="pubmed", term=query, retmax=str(limit), retmode="json", sort="relevance"
-    )
+    extra = {
+        "db": "pubmed", "term": query, "retmax": str(limit),
+        "retmode": "json", "sort": "relevance",
+    }
+    # PubMed accepts four-digit YYYY values for its own publication-date range.
+    # Send only the bounds that exist so an open end stays open.
+    if year_from or year_to:
+        extra["datetype"] = "pdat"
+        if year_from:
+            extra["mindate"] = year_from
+        if year_to:
+            extra["maxdate"] = year_to
+    params = _pubmed_params(**extra)
     r = requests.get(ESEARCH, params=params, timeout=config.HTTP_TIMEOUT)
     r.raise_for_status()
     idlist = r.json().get("esearchresult", {}).get("idlist", [])
@@ -207,8 +278,18 @@ def _pubmed_year(article):
 # Europe PMC (REST)
 # --------------------------------------------------------------------------
 
-def search_europepmc(query, limit=None):
+def search_europepmc(query, limit=None, year_from=None, year_to=None):
+    year_from, year_to = normalize_year_range(year_from, year_to)
     limit = limit or config.MAX_RESULTS_PER_QUERY
+
+    query = (query or "").strip()
+    if year_from or year_to:
+        clause = (
+            f"PUB_YEAR:[{year_from or EUROPEPMC_MIN_YEAR} "
+            f"TO {year_to or EUROPEPMC_MAX_YEAR}]"
+        )
+        query = f"{query} AND {clause}" if query else clause
+
     papers = []
     cursor = "*"
     while len(papers) < limit:
@@ -278,16 +359,24 @@ def _europepmc_to_paper(rec):
 # Crossref (REST)
 # --------------------------------------------------------------------------
 
-def search_crossref(query, limit=None):
+def search_crossref(query, limit=None, year_from=None, year_to=None):
+    year_from, year_to = normalize_year_range(year_from, year_to)
     limit = limit or config.MAX_RESULTS_PER_QUERY
+
+    # Restrict to real journal articles: a bare `query` also returns figure
+    # captions, supplementary files, book chapters and dissertations, which
+    # have no authors/year and pollute the results.
+    filters = ["type:journal-article"]
+    if year_from:
+        filters.append(f"from-pub-date:{year_from}-01-01")
+    if year_to:
+        filters.append(f"until-pub-date:{year_to}-12-31")
+
     params = {
         "query": query,
         "rows": str(min(limit, 1000)),
         "mailto": config.NCBI_EMAIL,
-        # Restrict to real journal articles: a bare `query` also returns figure
-        # captions, supplementary files, book chapters and dissertations, which
-        # have no authors/year and pollute the results.
-        "filter": "type:journal-article",
+        "filter": ",".join(filters),
         "select": "DOI,title,author,abstract,published,container-title,link",
     }
     r = requests.get(CROSSREF, params=params, timeout=config.HTTP_TIMEOUT)
