@@ -308,6 +308,11 @@ class MainYearRangeTests(unittest.TestCase):
 
 
 class SearchJobYearRangeTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(web.history, "record")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _job(self):
         return {
             "log": [],
@@ -447,7 +452,7 @@ class SearchApiYearRangeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("A AND B", ["pubmed"], 5, [], "2015", "2020", "", False),
+            ("A AND B", ["pubmed"], 5, [], "2015", "2020", "", False, None),
         )
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["year_from"], "2015")
@@ -464,7 +469,7 @@ class SearchApiYearRangeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("A", ["crossref"], 3, [], "2015", "2020", "", False),
+            ("A", ["crossref"], 3, [], "2015", "2020", "", False, None),
         )
 
     def test_explicit_blank_clears_the_saved_range(self):
@@ -478,7 +483,7 @@ class SearchApiYearRangeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             self.calls[0][2],
-            ("A", ["crossref"], 50, [], None, None, "", False),
+            ("A", ["crossref"], 50, [], None, None, "", False, None),
         )
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
         self.assertIsNone(saved["year_from"])

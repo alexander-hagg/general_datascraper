@@ -4,4 +4,5 @@ __pycache__/
 output/pdfs/
 output/checkpoint.json
 output/local_pdfs.json
+output/prompt_history.json
 output/*.xlsx

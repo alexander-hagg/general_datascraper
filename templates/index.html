@@ -25,6 +25,15 @@
     <section class="card">
       <h2><span class="step">1</span> Search for papers</h2>
 
+      <div class="history-row">
+        <label class="field-label history-label" for="history-search">Previous searches</label>
+        <select id="history-search" class="history-select" disabled>
+          <option value="">No previous searches yet</option>
+        </select>
+        <button class="ghost-btn mini" id="history-search-clear" type="button"
+                aria-label="Clear previous searches" title="Clear previous searches" disabled>Clear</button>
+      </div>
+
       <label class="field-label">Search terms</label>
       <p class="hint">Combine rows with AND/OR/NOT and groups with AND/OR/NOT. A group
         set to NOT is excluded from the part of the query before it, so
@@ -102,9 +111,25 @@
         model to pull out what you ask for. Closed papers are logged separately.</p>
 
       <label class="field-label" for="goal">What data do you want from the papers?</label>
+      <div class="history-row">
+        <label class="history-label" for="history-goal">Previous goals</label>
+        <select id="history-goal" class="history-select" disabled>
+          <option value="">No previous goals yet</option>
+        </select>
+        <button class="ghost-btn mini" id="history-goal-clear" type="button"
+                aria-label="Clear previous goals" title="Clear previous goals" disabled>Clear</button>
+      </div>
       <textarea id="goal" rows="3" placeholder="e.g. Every mutation that was tested, and whether it increased or decreased channel function"></textarea>
 
       <label class="field-label" for="columns">Column names for the spreadsheet <span class="muted">(comma-separated, optional)</span></label>
+      <div class="history-row">
+        <label class="history-label" for="history-columns">Previous columns</label>
+        <select id="history-columns" class="history-select" disabled>
+          <option value="">No previous columns yet</option>
+        </select>
+        <button class="ghost-btn mini" id="history-columns-clear" type="button"
+                aria-label="Clear previous columns" title="Clear previous columns" disabled>Clear</button>
+      </div>
       <input type="text" id="columns" placeholder="e.g. mutation, effect, position">
       <p class="hint">Paper key, row number, evidence/page and PDF columns are added automatically; those names are reserved.</p>
 

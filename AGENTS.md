@@ -34,10 +34,10 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
 - `config.py` is the single settings source: queries, sources, `YEAR_FROM` /
   `YEAR_TO`, local-PDF defaults (`LOCAL_PDF_DIR`, `LOCAL_PDF_RECURSIVE`,
   `MAX_LOCAL_PDFS`), LLM backend, `FIELDS` (drives the generated
-  JSON schema/prompt), PDF archiving, output paths, Flask host/port. The web
-  Settings panel persists email/model/max-results/year range/local folder to
-  `output/web_settings.json`; those values **override `config.py` at app
-  startup**.
+  JSON schema/prompt), PDF archiving, prompt-history path/caps, output paths,
+  Flask host/port. The web Settings panel persists email/model/max-results/year
+  range/local folder to `output/web_settings.json`; those values **override
+  `config.py` at app startup**.
 - `local_pdfs.py`: local folder source. `scan_folder()` validates the folder,
   reads pypdf metadata plus a DOI from the first three pages, dedupes by DOI then
   normalized title, and copies/hardlinks each valid `%PDF-` into `config.PDF_DIR`
@@ -45,6 +45,16 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   by normalized DOI then title. `output/local_pdfs.json` maps `paper_key` to the
   archived filename; `attach_to_papers()` re-attaches it when loading
   `search_results.xlsx` (missing files are ignored).
+- `history.py`: global prompt history store in `output/prompt_history.json`
+  (`{"version": 1, "entries": [...]}`). Kinds are `search`, `goal` and
+  `columns`; entries carry id/data/created_at/last_used/uses. Dedup uses a
+  canonical fingerprint of kind + JSON data (stable dict key order), duplicate
+  records increment `uses` and move to the front, and writes are atomic under a
+  `threading.Lock`. Caps are `PROMPT_HISTORY_MAX_ENTRIES` (100 total) and
+  `PROMPT_HISTORY_MAX_PER_KIND` (50). Missing/corrupt files read as empty.
+  `app.py` records after search/extract validation and before scanning or
+  processing; a history failure is logged as a warning and never fails the job.
+  Never record email/API keys/model/backend secrets here.
 - `searchers.py`: API clients + `SOURCE_REGISTRY`. To add a source, implement
   `search_<name>(query, limit=None, year_from=None, year_to=None)` returning
   paper dicts and add one registry entry; the UI and `/api/sources` list it
@@ -92,6 +102,21 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   (or sources without a query) is still a 400. Omitted `local_folder` /
   `local_recursive` keys fall back to saved settings; an explicitly blank folder
   disables local PDFs. Settings are validated only at search time.
+- **Prompt history is global across workspaces/browser sessions and
+  best-effort:** `app.py` records the normalized
+  search payload (including the browser's `query_tree` plus sources, max results,
+  years, journal terms and local-folder fields) after validation and before any
+  scan/search; Extract records the goal and, when non-empty, the joined columns
+  before processing. Any `history.record` failure is logged as a warning and
+  must not fail the job. `GET /api/history[?kind=search|goal|columns]` lists
+  entries newest-used first; `POST /api/history/clear` with an optional `kind`
+  clears one kind or all. Never expose the history file through a serving route.
+  The browser snapshot format is
+  `{type:"group", op:"AND", children:[{type:"term", text, op} |
+  {type:"group", op, children}]}` with **no node ids**; `queryModel.restore()`
+  regenerates ids and ignores invalid/empty nodes. Selecting a previous search
+  restores fields but never auto-runs; legacy entries without `query_tree` fall
+  back to one term containing the rendered query.
 - Checkpoint skips `extracted` and `closed` papers; `error` entries retry.
   Web search resets it, CLI only with `--reset`.
 - **The year range is separate from the boolean query:** it is never
@@ -113,7 +138,8 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   `PDF unavailable — download manually`; keep these reason strings stable.
 - Output files: `search_results.xlsx`, `extracted_data.xlsx` (appended),
   `closed_source_papers.xlsx` (appended), `checkpoint.json`,
-  `local_pdfs.json` (local mapping, git-ignored), `pdfs/`.
+  `local_pdfs.json` (local mapping, git-ignored), `prompt_history.json`
+  (global web prompt history, git-ignored), `pdfs/`.
 
 ## Repository gotchas
 
