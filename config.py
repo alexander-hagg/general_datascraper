@@ -135,6 +135,15 @@ FIELDS = [
 PDF_ARCHIVE_ENABLED = True
 PDF_DIR = OUTPUT_DIR / "pdfs"
 
+# Evidence quotes and annotated PDFs (Extract step). When enabled, the model is
+# asked for one short verbatim quote per extracted record. ScrapeLite locates
+# the quote in the archived PDF, records its 1-based page in `evidence_page`,
+# and writes a highlighted copy to output/annotated_pdfs/.
+# Scanned/image-only PDFs are not OCR'd, so their quotes stay unresolved.
+EVIDENCE_ENABLED = True
+EVIDENCE_MAX_CHARS = 300
+EVIDENCE_FUZZY_THRESHOLD = 0.75
+
 # Optional: a folder of PDFs you already have on this computer. Use it from the
 # web Search card, or from the CLI with --local-folder PATH. PDFs are copied
 # (or hardlinked) into PDF_DIR so extraction stays self-contained.
@@ -152,6 +161,8 @@ CLOSED_SOURCE_XLSX  = OUTPUT_DIR / "closed_source_papers.xlsx"
 EXTRACTED_XLSX      = OUTPUT_DIR / "extracted_data.xlsx"
 CHECKPOINT_JSON     = OUTPUT_DIR / "checkpoint.json"
 LOCAL_PDF_INDEX_JSON = OUTPUT_DIR / "local_pdfs.json"
+PDF_INDEX_JSON      = OUTPUT_DIR / "pdf_index.json"
+ANNOTATED_PDF_DIR   = OUTPUT_DIR / "annotated_pdfs"
 
 # Prompt history for the web app (searches, extraction goals and columns).
 # It is global across workspaces/browser sessions and git-ignored. Old entries

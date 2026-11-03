@@ -215,6 +215,19 @@ class ExtractRowTests(unittest.TestCase):
         self.assertEqual(rows[0]["subunit"], "")
         self.assertEqual(rows[0]["row_index"], 1)
 
+    def test_rows_copy_the_verbatim_evidence_field(self):
+        paper = {"title": "One", "doi": "10.1/one", "sources": ["pubmed"]}
+        records = [
+            {"subunit": "a4", "evidence": "A verbatim quote from the paper."},
+            {"subunit": "b2"},
+            {"subunit": "g2", "evidence": None},
+        ]
+        rows = main.build_extract_rows(paper, records, ["subunit"])
+        self.assertEqual(rows[0]["evidence"], "A verbatim quote from the paper.")
+        self.assertEqual(rows[1]["evidence"], "")
+        self.assertEqual(rows[2]["evidence"], "")
+        self.assertEqual([r["evidence_page"] for r in rows], ["", "", ""])
+
     def test_run_extract_uses_mode_and_writes_per_paper_row_indexes(self):
         records = [{"subunit": "a4"}, {"subunit": "b2"}]
         seen = {}
@@ -323,6 +336,148 @@ class ColumnValidationTests(unittest.TestCase):
             "evidence", "evidence_page", "subunit", "effect", None, "",
         ]
         self.assertEqual(main.extract_user_columns(header), ["subunit", "effect"])
+
+
+class EvidenceInstructionAndExtractorTests(unittest.TestCase):
+    def test_instruction_adds_the_evidence_rule(self):
+        records = main.make_instruction("Extract mutations", mode="records")
+        table = main.make_instruction("Extract mutations", mode="table")
+        for text in (records, table):
+            self.assertIn('"evidence"', text)
+            self.assertIn("VERBATIM", text)
+            self.assertIn("300", text)
+            self.assertIn("NEVER invent", text)
+        self.assertIn("TABLE ROW", table)
+        self.assertNotIn("TABLE ROW", records)
+
+    def test_instruction_omits_evidence_when_disabled(self):
+        with mock.patch.object(main.config, "EVIDENCE_ENABLED", False):
+            text = main.make_instruction("Extract mutations", mode="records")
+        self.assertNotIn('"evidence"', text)
+        self.assertIn("INDIVIDUAL RECORDS", text)
+
+    def test_schema_and_prompt_include_evidence(self):
+        schema = main.extractor.build_schema([("mutation", "text")])
+        item = schema["items"]
+        self.assertEqual(item["properties"]["evidence"], {"type": "string"})
+        self.assertIn("evidence", item["required"])
+
+        with mock.patch.object(main.extractor.config, "LLM_BACKEND", "ollama"):
+            ollama = main.extractor._build_prompt(
+                "TEXT", "Extract mutations", [("mutation", "text")]
+            )
+        self.assertIn('"evidence"', ollama)
+        self.assertIn("VERBATIM", ollama)
+        self.assertIn("JSON array", ollama)
+
+        with mock.patch.object(main.extractor.config, "LLM_BACKEND", "openai"):
+            openai = main.extractor._build_prompt(
+                "TEXT", "Extract mutations", [("mutation", "text")]
+            )
+        self.assertIn('"items"', openai)
+        self.assertIn('"evidence"', openai)
+
+    def test_schema_and_prompt_drop_evidence_when_disabled(self):
+        with mock.patch.object(main.extractor.config, "EVIDENCE_ENABLED", False):
+            schema = main.extractor.build_schema([("mutation", "text")])
+            prompt = main.extractor._build_prompt(
+                "TEXT", "Extract mutations", [("mutation", "text")]
+            )
+        self.assertNotIn("evidence", schema["items"]["properties"])
+        self.assertNotIn('"evidence"', prompt)
+
+    def test_extract_guarantees_a_string_evidence_field(self):
+        with mock.patch.object(main.extractor.config, "LLM_BACKEND", "ollama"), \
+             mock.patch.object(
+                 main.extractor, "_call_ollama", lambda prompt, fields: '[{"mutation": "M1"}]'
+             ):
+            records = main.extractor.extract("TEXT", fields=[("mutation", "text")])
+        self.assertEqual(records, [{"mutation": "M1", "evidence": ""}])
+
+        with mock.patch.object(main.extractor.config, "EVIDENCE_ENABLED", False), \
+             mock.patch.object(main.extractor.config, "LLM_BACKEND", "ollama"), \
+             mock.patch.object(
+                 main.extractor, "_call_ollama", lambda prompt, fields: '[{"mutation": "M1"}]'
+             ):
+            records = main.extractor.extract("TEXT", fields=[("mutation", "text")])
+        self.assertEqual(records, [{"mutation": "M1"}])
+
+
+class RunExtractEvidenceTests(unittest.TestCase):
+    def _paths(self, tmp):
+        return (
+            tmp / "extracted_data.xlsx",
+            tmp / "closed.xlsx",
+            tmp / "checkpoint.json",
+        )
+
+    def _paper(self):
+        return {
+            "title": "Paper One",
+            "doi": "10.1/one",
+            "pmid": "111",
+            "sources": ["pubmed"],
+        }
+
+    def _run(self, annotate, pdf_path):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            extracted, closed, checkpoint = self._paths(tmp)
+            with mock.patch.object(main.config, "EXTRACTED_XLSX", extracted), \
+                 mock.patch.object(main.config, "CLOSED_SOURCE_XLSX", closed), \
+                 mock.patch.object(main.config, "CHECKPOINT_JSON", checkpoint), \
+                 mock.patch.object(main.extractor, "check_backend", lambda: None), \
+                 mock.patch.object(
+                     main,
+                     "_prepare_paper",
+                     lambda p: ("full text " * 100, "test", {
+                         "path": pdf_path,
+                         "filename": "PMID_111.pdf" if pdf_path else "",
+                         "label": "article:pmc" if pdf_path else "none",
+                         "reason": "",
+                     }),
+                 ), \
+                 mock.patch.object(
+                     main.extractor,
+                     "extract",
+                     lambda text, fields=None, instruction=None:
+                         [{"subunit": "a4", "evidence": "mutation increased current"}],
+                 ), \
+                 mock.patch.object(
+                     main.pdf_annotations, "annotate_paper_rows", side_effect=annotate
+                 ):
+                main.run_extract(papers=[self._paper()], mode="records")
+            return read_sheet(extracted)
+
+    def test_run_extract_updates_evidence_page_before_writing(self):
+        def fake(rows, path, **kwargs):
+            rows[0]["evidence_page"] = "4"
+            return rows, {
+                "located": 1, "unresolved": 0, "warning": "",
+                "evidence": [],
+            }
+
+        table = self._run(fake, Path("/tmp/archived.pdf"))
+        objects = [dict(zip(table[0], row)) for row in table[1:]]
+        self.assertEqual(objects[0]["evidence"], "mutation increased current")
+        self.assertEqual(objects[0]["evidence_page"], "4")
+
+    def test_annotation_failure_only_warns(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            table = self._run(RuntimeError("broken PDF"), Path("/tmp/archived.pdf"))
+        objects = [dict(zip(table[0], row)) for row in table[1:]]
+        self.assertEqual(objects[0]["evidence"], "mutation increased current")
+        self.assertIn(objects[0]["evidence_page"], (None, ""))
+        self.assertIn("evidence warning: broken PDF", output.getvalue())
+
+    def test_no_pdf_skips_annotation_and_keeps_evidence_text(self):
+        annotate = mock.Mock()
+        table = self._run(annotate, None)
+        annotate.assert_not_called()
+        objects = [dict(zip(table[0], row)) for row in table[1:]]
+        self.assertEqual(objects[0]["evidence"], "mutation increased current")
+        self.assertIn(objects[0]["evidence_page"], (None, ""))
 
 
 class KeyFunctionTests(unittest.TestCase):

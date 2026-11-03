@@ -29,6 +29,7 @@ import extractor
 import fetcher
 import filters
 import local_pdfs
+import pdf_annotations
 import pdf_fetcher
 import searchers
 import writer
@@ -119,6 +120,9 @@ def make_instruction(goal="", mode="records", extra=""):
             "  the task. Do not skip any, and do not merge separate records into one row.",
             "- Return one JSON object per record.",
         ])
+
+    if getattr(config, "EVIDENCE_ENABLED", True):
+        lines.append(extractor.evidence_instruction(mode))
 
     extra = (extra or "").strip()
     if extra:
@@ -238,6 +242,8 @@ def build_extract_rows(paper, records, field_names, pdf_file="", pdf_source="non
         row["row_index"] = index
         for field in field_names:
             row[field] = record.get(field, "") if isinstance(record, dict) else ""
+        evidence = record.get("evidence", "") if isinstance(record, dict) else ""
+        row["evidence"] = "" if evidence is None else str(evidence)
         rows.append(row)
     return rows
 
@@ -481,6 +487,26 @@ def run_extract(limit=None, papers=None, mode="records"):
         out_rows = build_extract_rows(
             p, records, field_names, pdf_file=pdf_file, pdf_source=pdf_source
         )
+
+        # Locate evidence quotes and create the cached highlighted PDF. This is
+        # deliberately best-effort: a missing/broken PDF or a bad quote must
+        # never lose the extracted rows.
+        if getattr(config, "EVIDENCE_ENABLED", True) and pdf.get("path"):
+            try:
+                out_rows, summary = pdf_annotations.annotate_paper_rows(
+                    out_rows,
+                    pdf.get("path"),
+                    paper_key=paper_identity(p),
+                    title=p.get("title", ""),
+                    pdf_file=pdf_file,
+                    pdf_source=pdf_source,
+                )
+                message = pdf_annotations.summary_message(summary)
+                if message:
+                    print(f"  -> {message}")
+            except Exception as exc:  # noqa: BLE001 - evidence is best-effort
+                print(f"  !! evidence warning: {exc}")
+
         writer.append_xlsx(config.EXTRACTED_XLSX, EXTRACT_COLS, out_rows)
 
         # Rule 3: text was extractable but no PDF/preprint could be archived.

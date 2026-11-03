@@ -35,11 +35,14 @@ The results area has two tabs:
   it; the rows themselves are listed underneath. Rows whose paper cannot be
   identified are collected in a clearly labelled **Unlinked rows** group.
 
-Click any data row to highlight it. A panel on the right shows the selected
-paper and a placeholder for evidence. PDF viewing and annotation are not in
-this version yet, but the pane is already reserved for them. The technical
-`paper_key` column is used behind the scenes and is not shown in the data
-tables; your own extracted columns are always shown.
+Click any data row to select it. The panel on the right shows the paper
+metadata, the **verbatim evidence quote** for that row, its 1-based page and
+whether the quote was found exactly, only fuzzily, or not at all. When a PDF is
+available, an **annotated PDF viewer** opens at that page with the quote
+highlighted; **Open in new tab ↗** opens the same PDF in its own browser tab.
+If no PDF was archived, the viewer is hidden and the quote panel remains as the
+fallback. The technical `paper_key` column is used behind the scenes and is not
+shown in the data tables; your own extracted columns are always shown.
 
 
 ## Extraction modes
@@ -61,6 +64,9 @@ python main.py --extract-only --mode table
 
 Omitting `--mode` uses `EXTRACTION_MODE = "records"` from `config.py`.
 
+In both modes the model is also asked for one short **verbatim evidence quote**
+per output row (see **Evidence quotes & annotated PDFs** below).
+
 
 ## Paper identity and the spreadsheet columns
 
@@ -74,13 +80,16 @@ next time extraction runs, without losing any rows or values. Where an older
 extracted row has a DOI, the key is filled in from that DOI; rows with no
 identifying information are left blank and appear under **Unlinked rows**.
 
-`extracted_data.xlsx` also reserves `evidence` and `evidence_page` columns now
-(they are empty until the evidence features arrive). The names `paper_key`,
+`extracted_data.xlsx` also has reserved `evidence` and `evidence_page` columns.
+`evidence` holds the model's verbatim supporting quote; `evidence_page` is the
+1-based page where ScrapeLite located that quote in the archived PDF (blank when
+the quote could not be located or no PDF was archived). The names `paper_key`,
 `row_index`, `evidence`, `evidence_page`, `pdf_file`, `pdf_source`, plus the
 existing `doi` and `source` metadata columns, cannot be used as your own
 column names; the app asks you to rename them if you try. Duplicate column
 names (ignoring case) are rejected as well, so the Excel header stays
-unambiguous.
+unambiguous. Older workbooks gain the new columns automatically on the next
+extraction run.
 
 
 
@@ -431,9 +440,64 @@ before.
 PDF archiving is on by default; set `PDF_ARCHIVE_ENABLED = False` in
 `config.py` to skip it. The `output/pdfs/` folder is git-ignored.
 
+## Evidence quotes & annotated PDFs
+
+Every extracted row now carries a short **verbatim** `evidence` quote copied
+from the paper text. The model is instructed never to paraphrase; the quote is
+limited to about 300 characters (`EVIDENCE_MAX_CHARS`). In table mode there is
+one quote per table row, matching the one-output-row-per-table-row rule. Set
+`EVIDENCE_ENABLED = False` in `config.py` to turn the whole feature off.
+
+During **Extract**, after the model answers, ScrapeLite:
+
+1. searches the archived PDF page by page for each quote. An exact
+   case/whitespace-insensitive match wins; if that fails, a
+   `difflib.SequenceMatcher` fuzzy match is accepted at or above
+   `EVIDENCE_FUZZY_THRESHOLD` (default `0.75`);
+2. writes the 1-based page number to `evidence_page`. Unlocated quotes keep a
+   blank page (they are never guessed);
+3. writes one cached, highlighted copy per paper to
+   `output/annotated_pdfs/`. Annotation comments name the row and contain the
+   quote. Exact and fuzzy matches use different highlight colours;
+4. updates `output/pdf_index.json` with the source PDF, annotation file,
+   evidence page/status list and timestamp. Only basenames are stored, never
+   absolute paths. The annotation filename contains a hash of the paper key,
+   source PDF bytes and evidence list, so changing any of those regenerates the
+   file; an identical request reuses the existing cached copy.
+
+The index also registers a paper when **no** quote could be located, so the
+viewer can still show the original PDF. If annotation itself fails for any
+reason, the extraction continues and the rows are still written — only a
+warning is logged.
+
+### Viewer and API
+
+The **Data & PDFs** tab shows the annotated PDF beside the grouped extracted
+rows. Clicking a row loads
+`/api/annotated-pdf/<paper_key>#page=<evidence_page>`; the quote text, page and
+match status stay visible above it. Use **Open in new tab ↗** if you prefer the
+browser's full PDF viewer. Browser PDF viewers differ in whether they display
+embedded highlights, so the quote panel is always the fallback.
+
+For API/script users, `GET /api/results` keeps its existing `search`,
+`extracted` and `closed` keys and adds an `annotations` mapping keyed by
+`paper_key`. Each entry contains `available`, `pdf_file`, `pdf_source`, `title`
+and the `evidence` status list. `GET /api/annotated-pdf/<paper_key>` serves the
+cached annotation, regenerates it on demand from the index if the file is
+missing, or serves the original archived PDF when no quote resolved. Unknown
+keys and unsafe paths return 404; the index itself and arbitrary files are
+never exposed.
+
+`output/pdf_index.json` and `output/annotated_pdfs/` are git-ignored. The page
+numbers are text-layer pages only: **there is no OCR**, so scanned/image-only
+PDFs leave quotes unresolved even though their extracted data is kept.
+
 ## Requirements
 
 - Windows 10/11 (macOS/Linux also work if you run `python app.py` directly)
 - Python 3.10+ (installed automatically by `setup.bat` via winget if missing)
 - [Ollama](https://ollama.com) (installed automatically by `setup.bat` if missing)
+- PyMuPDF for evidence page numbers and annotated PDFs (installed from
+  `requirements.txt` by the setup script; extraction still works with a warning
+  if it is unavailable)
 - ~8 GB free disk for the model, plus a few GB of RAM to run it

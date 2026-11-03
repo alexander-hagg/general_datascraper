@@ -6,10 +6,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import quote
 
+import pymupdf
 from openpyxl import Workbook
 
 import app as web
+import pdf_annotations
 
 
 def make_workbook(path, header, rows):
@@ -30,6 +33,20 @@ def read_sheet(path):
     return rows
 
 
+def make_pdf(path, pages):
+    """Create a small real PDF; `pages` is a list of lists of text lines."""
+    doc = pymupdf.open()
+    for lines in pages:
+        page = doc.new_page()
+        for index, line in enumerate(lines):
+            page.insert_text((72, 72 + index * 24), line)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(path)
+    doc.close()
+    return path
+
+
 class ResultsApiTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -37,7 +54,11 @@ class ResultsApiTests(unittest.TestCase):
         self.search = self.dir / "search_results.xlsx"
         self.extracted = self.dir / "extracted_data.xlsx"
         self.closed = self.dir / "closed_source_papers.xlsx"
+        self.index = self.dir / "pdf_index.json"
         self.client = web.app.test_client()
+        patcher = mock.patch.object(web.config, "PDF_INDEX_JSON", self.index)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -64,7 +85,10 @@ class ResultsApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
-        self.assertEqual(set(payload), {"search", "extracted", "closed"})
+        self.assertEqual(
+            set(payload), {"search", "extracted", "closed", "annotations"}
+        )
+        self.assertEqual(payload["annotations"], {})
         self.assertIsNone(payload["closed"])
 
         search = payload["search"]
@@ -1042,6 +1066,231 @@ class ExtractJobHistoryTests(unittest.TestCase):
             "\n".join(job["log"]),
         )
         self.assertFalse(self.path.exists())
+
+
+class AnnotationsApiTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.pdf_dir = self.dir / "pdfs"
+        self.pdf_dir.mkdir()
+        self.annotated_dir = self.dir / "annotated_pdfs"
+        self.index = self.dir / "pdf_index.json"
+        self.source = make_pdf(
+            self.pdf_dir / "PMID_1.pdf",
+            [["Introduction only."],
+             ["The mutation increased current in oocytes.", "Second sentence."]],
+        )
+        self.key = "pmid:1"
+        self.client = web.app.test_client()
+        for name, value in (
+            ("PDF_DIR", self.pdf_dir),
+            ("ANNOTATED_PDF_DIR", self.annotated_dir),
+            ("PDF_INDEX_JSON", self.index),
+        ):
+            patcher = mock.patch.object(web.config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _annotate(self, quotes):
+        rows = [{"row_index": i, "evidence": q} for i, q in enumerate(quotes, 1)]
+        return pdf_annotations.annotate_paper_rows(
+            rows,
+            self.source,
+            paper_key=self.key,
+            title="Paper",
+            pdf_file=self.source.name,
+            pdf_source="article:pmc",
+        )
+
+    def _url(self, key=None):
+        return "/api/annotated-pdf/" + quote(key or self.key, safe="")
+
+    @staticmethod
+    def _annotation_count(pdf_bytes):
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as handle:
+            handle.write(pdf_bytes)
+            handle.flush()
+            doc = pymupdf.open(handle.name)
+            try:
+                return sum(len(list(page.annots())) for page in doc)
+            finally:
+                doc.close()
+
+    def test_serves_existing_annotation_inline(self):
+        _rows, summary = self._annotate(["mutation increased current"])
+        self.assertTrue(summary["annotation_file"])
+        response = self.client.get(self._url())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "application/pdf")
+        self.assertTrue(response.data.startswith(b"%PDF-"))
+        self.assertGreaterEqual(self._annotation_count(response.data), 1)
+
+    def test_regenerates_a_missing_annotation(self):
+        _rows, summary = self._annotate(["mutation increased current"])
+        annotation = self.annotated_dir / summary["annotation_file"]
+        self.assertTrue(annotation.exists())
+        annotation.unlink()
+        self.assertFalse(annotation.exists())
+
+        response = self.client.get(self._url())
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data.startswith(b"%PDF-"))
+        self.assertTrue(annotation.exists())
+        self.assertGreaterEqual(self._annotation_count(response.data), 1)
+
+    def test_serves_original_when_no_evidence_resolves(self):
+        _rows, summary = self._annotate(["a sentence that is not in the paper"])
+        self.assertEqual(summary["annotation_file"], "")
+        response = self.client.get(self._url())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, self.source.read_bytes())
+
+    def test_unknown_key_and_traversal_are_404(self):
+        self.assertEqual(self.client.get(self._url("pmid:missing")).status_code, 404)
+        self.assertEqual(
+            self.client.get("/api/annotated-pdf/" + quote("../etc/passwd", safe="")).status_code,
+            404,
+        )
+
+        self.index.write_text(json.dumps({
+            "pmid:1": {
+                "paper_key": "pmid:1",
+                "pdf_file": "../secret.pdf",
+                "pdf_source": "article:pmc",
+                "title": "Paper",
+                "annotation_file": "",
+                "annotation_hash": "",
+                "evidence": [],
+            }
+        }), encoding="utf-8")
+        self.assertEqual(self.client.get(self._url()).status_code, 404)
+
+    def test_results_include_api_safe_annotations(self):
+        self._annotate(["mutation increased current", "missing quote"])
+        extracted = self.dir / "extracted_data.xlsx"
+        make_workbook(
+            extracted,
+            ["paper_key", "row_index", "evidence", "evidence_page", "mutation"],
+            [["pmid:1", 1, "mutation increased current", 2, "M1"]],
+        )
+        with mock.patch.object(web.config, "EXTRACTED_XLSX", extracted), \
+             mock.patch.object(web.config, "SEARCH_RESULTS_XLSX", self.dir / "missing.xlsx"), \
+             mock.patch.object(web.config, "CLOSED_SOURCE_XLSX", self.dir / "missing2.xlsx"):
+            payload = self.client.get("/api/results").get_json()
+
+        self.assertEqual(
+            set(payload), {"search", "extracted", "closed", "annotations"}
+        )
+        annotation = payload["annotations"][self.key]
+        self.assertTrue(annotation["available"])
+        self.assertEqual(annotation["pdf_file"], "PMID_1.pdf")
+        self.assertEqual(annotation["pdf_source"], "article:pmc")
+        self.assertEqual(
+            [item["status"] for item in annotation["evidence"]],
+            ["exact", "unresolved"],
+        )
+        serialized = json.dumps(payload)
+        self.assertNotIn(str(self.dir), serialized)
+
+
+class ExtractJobEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(web.history, "record")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _job(self):
+        return {
+            "log": [],
+            "progress": {"done": 0, "total": 0, "current": ""},
+            "result": None,
+            "status": "running",
+            "error": None,
+        }
+
+    def _run(self, annotate):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            extracted = tmp / "extracted_data.xlsx"
+            job = self._job()
+            paper = {
+                "title": "Paper One",
+                "doi": "10.1/new",
+                "pmid": "555",
+                "sources": ["pubmed"],
+            }
+            pdf_path = tmp / "pdfs" / "PMID_555.pdf"
+            pdf_path.parent.mkdir()
+            make_pdf(pdf_path, [["The mutation changed the current."]])
+            with mock.patch.object(web.config, "EXTRACTED_XLSX", extracted), \
+                 mock.patch.object(web.config, "CLOSED_SOURCE_XLSX", tmp / "closed.xlsx"), \
+                 mock.patch.object(web.config, "CHECKPOINT_JSON", tmp / "checkpoint.json"), \
+                 mock.patch.object(web.config, "PDF_ARCHIVE_ENABLED", False), \
+                 mock.patch.object(web, "apply_settings", lambda s: None), \
+                 mock.patch.object(web, "load_settings", lambda: {}), \
+                 mock.patch.object(web, "_load_search_results", lambda required=False: [paper]), \
+                 mock.patch.object(
+                     web,
+                     "_prepare_paper",
+                     lambda p: ("full text " * 100, "test", {
+                         "path": pdf_path,
+                         "filename": pdf_path.name,
+                         "label": "article:pmc",
+                         "reason": "",
+                     }),
+                 ), \
+                 mock.patch.object(
+                     web.extractor,
+                     "extract",
+                     lambda text, fields=None, instruction=None:
+                         [{"mutation": "M2", "evidence": "mutation changed the current"}],
+                 ), \
+                 mock.patch.object(web.pdf_annotations, "annotate_paper_rows", side_effect=annotate):
+                web._run_extract_job(job, "Extract mutations", ["mutation"], mode="records")
+            return job, read_sheet(extracted)
+
+    def test_extract_job_updates_evidence_page_and_reports_counts(self):
+        def fake(rows, path, **kwargs):
+            rows[0]["evidence_page"] = "1"
+            return rows, {
+                "located": 1, "unresolved": 0, "warning": "",
+                "evidence": [],
+            }
+
+        job, table = self._run(fake)
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["result"]["evidence_located"], 1)
+        self.assertEqual(job["result"]["evidence_unresolved"], 0)
+        self.assertIn("1 evidence quote(s) located, 0 unresolved", "\n".join(job["log"]))
+        objects = [dict(zip(table[0], row)) for row in table[1:]]
+        self.assertEqual(objects[0]["evidence"], "mutation changed the current")
+        self.assertEqual(objects[0]["evidence_page"], "1")
+
+    def test_annotation_failure_only_warns_and_keeps_blank_page(self):
+        job, table = self._run(RuntimeError("broken PDF"))
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["result"]["annotation_warnings"], 1)
+        self.assertIn("evidence warning: broken PDF", "\n".join(job["log"]))
+        objects = [dict(zip(table[0], row)) for row in table[1:]]
+        self.assertEqual(objects[0]["evidence"], "mutation changed the current")
+        self.assertIn(objects[0]["evidence_page"], (None, ""))
+
+
+class DataTabViewerMarkupTests(unittest.TestCase):
+    def test_viewer_markup_and_api_plumbing_exist(self):
+        root = Path(__file__).resolve().parent.parent
+        template = (root / "templates" / "index.html").read_text(encoding="utf-8")
+        script = (root / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('id="pdf-viewer"', template)
+        self.assertIn('id="pdf-new-tab"', template)
+        self.assertIn("No archived PDF for this paper", template)
+        self.assertIn("/api/annotated-pdf/", script)
+        self.assertIn("data.annotations", script)
+        self.assertIn("evidenceMetadataForRow", script)
 
 
 if __name__ == "__main__":
