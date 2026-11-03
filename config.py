@@ -39,6 +39,13 @@ SOURCES = ["pubmed", "europepmc", "crossref"]
 # Safety cap: max results per query, per source. Raise/lower as you like.
 MAX_RESULTS_PER_QUERY = 50
 
+# Optional publication-year range, applied by every search source.
+# Use four-digit years (integers or strings): YEAR_FROM = 2015, YEAR_TO = 2024.
+# Leave None (or "") for no limit on that side; both None means all years.
+# The range is sent to the APIs separately and is NOT added to the query text.
+YEAR_FROM = None
+YEAR_TO = None
+
 # Journals to drop from the results. Matching is case-insensitive and uses
 # substrings, so a full journal name also catches capitalization/spacing
 # differences and extra punctuation. It is applied AFTER all sources are

@@ -56,6 +56,22 @@
           <label class="field-label" for="max-results">Max results / site</label>
           <input type="text" inputmode="numeric" pattern="[0-9]*" data-numeric id="max-results" value="50">
         </div>
+        <div class="col col-years">
+          <label class="field-label">Publication years <span class="muted">(optional)</span></label>
+          <div class="year-range">
+            <div class="year-field">
+              <label class="year-label" for="year-from">From year</label>
+              <input type="text" inputmode="numeric" pattern="[0-9]{4}" maxlength="4"
+                     data-numeric id="year-from" placeholder="e.g. 2015">
+            </div>
+            <div class="year-field">
+              <label class="year-label" for="year-to">To year</label>
+              <input type="text" inputmode="numeric" pattern="[0-9]{4}" maxlength="4"
+                     data-numeric id="year-to" placeholder="e.g. 2024">
+            </div>
+          </div>
+          <p class="hint year-hint">Four digits (e.g. 2015). Leave a box blank for no limit.</p>
+        </div>
       </div>
 
       <label class="field-label" for="excluded-journals">Exclude journals <span class="muted">(optional, one per line)</span></label>

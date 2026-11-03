@@ -81,24 +81,57 @@ async function loadSources() {
 
 /* ---------- settings ---------- */
 
+// Read and validate the optional publication-year range from the Search card.
+// The server validates again; this just gives an immediate, clear message.
+function readYearRange() {
+  const from = document.getElementById("year-from").value.trim();
+  const to = document.getElementById("year-to").value.trim();
+  if (from && !/^[0-9]{4}$/.test(from)) {
+    return { error: "From year must be a four-digit number (e.g. 2015)." };
+  }
+  if (to && !/^[0-9]{4}$/.test(to)) {
+    return { error: "To year must be a four-digit number (e.g. 2024)." };
+  }
+  if (from && to && parseInt(from, 10) > parseInt(to, 10)) {
+    return { error: "Start year must not be after end year." };
+  }
+  return { year_from: from, year_to: to };
+}
+
+// Readable label used in status messages. Kept separate from the query text.
+function formatYearRange(from, to) {
+  const yf = String(from || "").trim();
+  const yt = String(to || "").trim();
+  if (yf && yt) return yf + "-" + yt;
+  if (yf) return yf + " onwards";
+  if (yt) return "up to " + yt;
+  return "";
+}
+
 async function loadSettings() {
   const s = await getJSON("/api/settings");
   document.getElementById("set-email").value = s.email || "";
   document.getElementById("set-model").value = s.model || "";
   document.getElementById("set-max").value = s.max_results || 50;
   document.getElementById("max-results").value = s.max_results || 50;
+  document.getElementById("year-from").value = s.year_from || "";
+  document.getElementById("year-to").value = s.year_to || "";
   const journals = s.excluded_journals;
   document.getElementById("excluded-journals").value =
     Array.isArray(journals) ? journals.join("\n") : (journals || "");
 }
 
 async function saveSettings() {
+  const years = readYearRange();
+  if (years.error) { setBanner(years.error, "error"); return; }
   try {
     const body = {
       email: document.getElementById("set-email").value.trim(),
       model: document.getElementById("set-model").value.trim(),
       max_results: parseInt(document.getElementById("set-max").value, 10) || 50,
       excluded_journals: document.getElementById("excluded-journals").value,
+      year_from: years.year_from,
+      year_to: years.year_to,
     };
     await postJSON("/api/settings", body);
     document.getElementById("max-results").value = body.max_results;
@@ -969,8 +1002,10 @@ async function doSearch() {
   const query = buildQuery();
   const sources = [...document.querySelectorAll("#source-list input:checked")].map(c => c.value);
   const maxResults = parseInt(document.getElementById("max-results").value, 10) || 50;
+  const years = readYearRange();
   if (!query) { setBanner("Enter at least one search term.", "error"); return; }
   if (!sources.length) { setBanner("Choose at least one website.", "error"); return; }
+  if (years.error) { setBanner(years.error, "error"); return; }
 
   try {
     const { job_id } = await postJSON("/api/search", {
@@ -978,6 +1013,8 @@ async function doSearch() {
       sources,
       max_results: maxResults,
       excluded_journals: document.getElementById("excluded-journals").value,
+      year_from: years.year_from,
+      year_to: years.year_to,
     });
     setBusy(true);
     showProgress(true);
@@ -1061,7 +1098,9 @@ function pollJob(jobId) {
         if (job.result && job.result.added !== undefined) {
           const excluded = job.result.excluded || 0;
           const suffix = excluded ? ` (${excluded} excluded by journal)` : "";
-          setBanner(`Search finished: ${job.result.total} papers${suffix}.`, "ok");
+          const years = formatYearRange(job.result.year_from, job.result.year_to);
+          const rangeSuffix = years ? ` (years ${years})` : "";
+          setBanner(`Search finished: ${job.result.total} papers${rangeSuffix}${suffix}.`, "ok");
         } else if (job.result && job.result.extracted !== undefined) {
           const modeLabel = job.result.mode === "table" ? "table rows" : "individual records";
           setBanner(`Extraction finished (${modeLabel}): ${job.result.extracted} row(s) extracted, ${job.result.closed} paper(s) closed.`, "ok");

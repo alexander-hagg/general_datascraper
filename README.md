@@ -201,6 +201,57 @@ Things to know:
   remove those records.
 
 
+## Publication-year range
+
+The Search card has optional **From year** / **To year** boxes next to
+**Max results / site**. Leave either box blank for no limit on that side and use
+four-digit years (for example `2015`). A start year after the end year is
+rejected with a clear message.
+
+The range is sent to each website as a **separate** search parameter. It is
+never added to the boolean query shown in **Query preview**, so
+`A AND B` stays `A AND B` while the date limit is applied behind the scenes.
+The search log and completion message show the applied range separately, e.g.
+`Search finished: 42 papers (years 2015-2024).`
+
+The same range is available on the command line:
+
+```
+python main.py --search-only --year-from 2015 --year-to 2024
+```
+
+or as defaults in `config.py`:
+
+```python
+YEAR_FROM = 2015
+YEAR_TO = 2024
+```
+
+Omit an option (or leave the config value as `None`) for an open end. The web
+app saves the years with its other settings, so they come back next time;
+clicking **Search papers** also saves an explicitly supplied range. Years saved
+in the web app override `config.py` while the app is running, just like the
+email and model settings.
+
+How each website applies it:
+
+- **PubMed** uses its publication-date search parameters (`datetype=pdat` plus
+  `mindate`/`maxdate`). Four-digit `YYYY` values are valid there.
+- **Europe PMC** appends a query clause such as `PUB_YEAR:[2015 TO 2024]`. If
+  only one bound is given, the open end is `1000` (missing from) or `3000`
+  (missing to).
+- **Crossref** adds `from-pub-date:YYYY-01-01` and/or
+  `until-pub-date:YYYY-12-31` to its `filter`, keeping
+  `type:journal-article`. Crossref applies the filter to the publication-date
+  metadata it has, so records with incomplete dates can behave differently.
+  As with every Crossref search, the query itself stays relevance-based rather
+  than strict boolean matching.
+
+Journal exclusions remain a post-search filter and apply on top of the year
+range. The year range is pushed into each website's query, so it also affects
+which papers are available to the journal blocklist.
+
+
 ## Search suggestions
 
 Two kinds of help are available while you build the query:
