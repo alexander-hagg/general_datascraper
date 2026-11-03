@@ -24,6 +24,65 @@ for → everything lands in an Excel file in the `output/` folder.
 That's it. The Excel files are the output; the browser is just the control panel.
 
 
+## Search & Extract vs Data & PDFs
+
+The results area has two tabs:
+
+- **Search & Extract** (the default) shows the papers that were found.
+- **Data & PDFs** appears as soon as there are extracted rows. It groups those
+  rows by paper, so you can see at a glance which paper each row came from.
+  Each group shows the paper title, journal, year and how many rows belong to
+  it; the rows themselves are listed underneath. Rows whose paper cannot be
+  identified are collected in a clearly labelled **Unlinked rows** group.
+
+Click any data row to highlight it. A panel on the right shows the selected
+paper and a placeholder for evidence. PDF viewing and annotation are not in
+this version yet, but the pane is already reserved for them. The technical
+`paper_key` column is used behind the scenes and is not shown in the data
+tables; your own extracted columns are always shown.
+
+
+## Extraction modes
+
+The Extract card has an **Extraction mode** selector:
+
+- **Individual records** (default) — one output row per distinct record the
+  model finds. This is the right choice for prose, mixed papers, and most
+  everyday extraction.
+- **Table rows** — one output row per row of a results table. The model is told
+  never to merge, combine or summarise separate table rows. Use this when a
+  paper reports a table and every table row must stay separate.
+
+The same choice is available from the command line:
+
+```
+python main.py --extract-only --mode table
+```
+
+Omitting `--mode` uses `EXTRACTION_MODE = "records"` from `config.py`.
+
+
+## Paper identity and the spreadsheet columns
+
+Every search-result and extracted row now carries a stable `paper_key` (PMID
+first, then lowercased DOI, then title) so the app can connect extracted rows
+back to their paper.
+Extracted rows also have a 1-based `row_index` that restarts for each paper.
+Older `search_results.xlsx` files without a `paper_key` still work: the key is
+worked out in memory, and existing extracted files are upgraded in place the
+next time extraction runs, without losing any rows or values. Where an older
+extracted row has a DOI, the key is filled in from that DOI; rows with no
+identifying information are left blank and appear under **Unlinked rows**.
+
+`extracted_data.xlsx` also reserves `evidence` and `evidence_page` columns now
+(they are empty until the evidence features arrive). The names `paper_key`,
+`row_index`, `evidence`, `evidence_page`, `pdf_file`, `pdf_source`, plus the
+existing `doi` and `source` metadata columns, cannot be used as your own
+column names; the app asks you to rename them if you try. Duplicate column
+names (ignoring case) are rejected as well, so the Excel header stays
+unambiguous.
+
+
 
 ## Dry run (preview without changing anything)
 

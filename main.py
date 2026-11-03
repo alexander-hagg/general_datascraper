@@ -5,6 +5,7 @@ main.py — run the whole pipeline, or just one stage.
     python main.py --search-only   only search -> output/search_results.xlsx
     python main.py --extract-only  only fetch + extract (reads search_results.xlsx)
     python main.py --limit 5       extract at most 5 papers (quick demo)
+    python main.py --mode table    one output row per row of a results table
     python main.py --reset         clear the resume checkpoint, then run
 
 See README.md for the full picture.
@@ -30,16 +31,211 @@ import writer
 from checkpoint import Checkpoint
 
 SEARCH_COLS = [
-    "source", "title", "authors", "doi", "pmid", "pmcid",
+    "paper_key", "source", "title", "authors", "doi", "pmid", "pmcid",
     "year", "journal", "is_open_access", "fulltext_url",
 ]
 CLOSED_COLS = ["title", "authors", "doi", "source", "reason"]
-EXTRACT_COLS = ["doi", "source", "pdf_file", "pdf_source"] + [e[0] for e in config.FIELDS]
+
+# Columns that belong to the pipeline, not to the user's extracted fields.
+# They are produced automatically and can never be supplied as web columns.
+RESERVED_COLUMNS = (
+    "paper_key", "row_index", "evidence", "evidence_page", "pdf_file", "pdf_source",
+)
+# `doi` and `source` are pre-existing metadata columns; letting a user-supplied
+# field use those names would create duplicate Excel headers and overwrite the
+# real metadata, so they are protected too.
+PROTECTED_COLUMNS = RESERVED_COLUMNS + ("doi", "source")
+
+EXTRACT_META_COLUMNS = (
+    "paper_key", "row_index", "doi", "source",
+    "pdf_file", "pdf_source", "evidence", "evidence_page",
+)
+
+EXTRACTION_MODES = ("records", "table")
+MODE_LABELS = {"records": "Individual records", "table": "Table rows"}
+
+
+def extract_columns(field_names):
+    """Return the full extracted_data.xlsx layout for the given user fields."""
+    return list(EXTRACT_META_COLUMNS) + [str(f) for f in field_names]
+
+
+EXTRACT_COLS = extract_columns([e[0] for e in config.FIELDS])
 
 # Closed-source reasons introduced by PDF archiving.
 NO_PDF_REASON = "no PDF and no preprint found"
 PDF_MANUAL_REASON = "PDF unavailable — download manually"
 PDF_NO_TEXT_REASON = "PDF saved but no extractable text"
+
+
+def normalize_extraction_mode(mode):
+    """Validate and normalise an extraction mode ('records' or 'table')."""
+    value = str(mode or "records").strip().lower()
+    if value not in EXTRACTION_MODES:
+        raise ValueError(
+            f"Unknown extraction mode '{mode}'. Choose one of: {', '.join(EXTRACTION_MODES)}."
+        )
+    return value
+
+
+def make_instruction(goal="", mode="records", extra=""):
+    """Build the extraction prompt shared by the CLI and the web app.
+
+    `goal` is the task in the user's words; `extra` appends a caller-supplied
+    instruction (the CLI uses config.INSTRUCTION there). The records/table
+    contract lives here so both interfaces ask the model for the same thing.
+    """
+    mode = normalize_extraction_mode(mode)
+    goal = (goal or "").strip() or "Extract the relevant data described in the text."
+
+    lines = [
+        "You are an expert research assistant. Read the full paper TEXT below very carefully.",
+        f"Task: {goal}",
+        "",
+        "IMPORTANT RULES:",
+        "- NEVER invent, guess, or use outside knowledge. Only report what is explicitly",
+        "  written in the TEXT. If it is not in the paper, do not put it in the answer.",
+        "- If a value is missing, leave that field empty — do not make one up.",
+        "- Keep wording and values consistent with how they appear in the paper.",
+        "- If no record matches the task, return an empty list [].",
+    ]
+
+    if mode == "table":
+        lines.extend([
+            "- Extraction mode: TABLE ROWS. Treat every row of a results table as its",
+            "  own record. A paper may produce many rows; return ONE JSON object per row.",
+            "- NEVER merge, combine, aggregate, or summarize separate table rows into one",
+            "  object, even when they share a condition or differ only in one value.",
+            "- Ignore table headers, captions, footnotes and totals unless they are data",
+            "  rows themselves.",
+        ])
+    else:
+        lines.extend([
+            "- Extraction mode: INDIVIDUAL RECORDS. Extract EVERY record that matches",
+            "  the task. Do not skip any, and do not merge separate records into one row.",
+            "- Return one JSON object per record.",
+        ])
+
+    extra = (extra or "").strip()
+    if extra:
+        lines.extend(["", "ADDITIONAL INSTRUCTIONS:", extra])
+    return "\n".join(lines)
+
+
+def validate_user_columns(columns):
+    """Validate web-supplied column names.
+
+    Returns `(cleaned, errors)`:
+      cleaned — names with blanks removed and original spelling preserved
+      errors  — list of human-readable problems; empty when the input is valid
+    Reserved/technical names are rejected rather than silently ignored, and
+    duplicates are rejected (case-insensitively) so the Excel header stays
+    unambiguous.
+    """
+    if columns is None:
+        return [], []
+    if isinstance(columns, str):
+        columns = columns.split(",")
+    if not isinstance(columns, (list, tuple)):
+        return [], ["Columns must be a list of names."]
+
+    cleaned, seen, reserved, duplicates = [], set(), [], []
+    protected = {name.lower(): name for name in PROTECTED_COLUMNS}
+    for raw in columns:
+        if raw is None:
+            continue
+        name = str(raw).strip()
+        if not name:
+            continue
+        lowered = name.lower()
+        if lowered in protected:
+            reserved.append(name)
+            continue
+        if lowered in seen:
+            duplicates.append(name)
+            continue
+        seen.add(lowered)
+        cleaned.append(name)
+
+    errors = []
+    if reserved:
+        errors.append(
+            "These column names are reserved and added automatically: "
+            + ", ".join(dict.fromkeys(reserved))
+        )
+    if duplicates:
+        errors.append(
+            "Duplicate column names: " + ", ".join(dict.fromkeys(duplicates))
+        )
+    return cleaned, errors
+
+
+def extract_user_columns(header):
+    """Non-technical columns from an extracted_data.xlsx header."""
+    meta = set(EXTRACT_META_COLUMNS)
+    return [
+        str(name).strip()
+        for name in (header or [])
+        if name not in (None, "") and str(name).strip() not in meta
+    ]
+
+
+def paper_identity(paper):
+    """Stored paper_key when present, else the canonical searchers.paper_key.
+
+    Returns "" when the paper has no identifying metadata at all (so callers
+    can put it in the "unlinked" bucket instead of inventing `title:`).
+    """
+    stored = str(paper.get("paper_key") or "").strip()
+    if stored:
+        return stored
+    if paper.get("pmid") or paper.get("doi") or str(paper.get("title") or "").strip():
+        return searchers.paper_key(paper)
+    return ""
+
+
+def paper_to_row(paper):
+    """Convert a paper dict into a search_results.xlsx row."""
+    return {
+        "paper_key": paper_identity(paper),
+        "source": ", ".join(paper.get("sources", [])),
+        "title": paper.get("title", ""),
+        "authors": paper.get("authors", ""),
+        "doi": paper.get("doi", ""),
+        "pmid": paper.get("pmid", ""),
+        "pmcid": paper.get("pmcid", ""),
+        "year": paper.get("year", ""),
+        "journal": paper.get("journal", ""),
+        "is_open_access": paper.get("is_oa"),
+        "fulltext_url": paper.get("fulltext_url", ""),
+    }
+
+
+def build_extract_rows(paper, records, field_names, pdf_file="", pdf_source="none"):
+    """Build extracted_data.xlsx rows for one paper.
+
+    `row_index` is 1-based within this paper's extraction batch and resets for
+    every paper, so it is a stable within-paper row number. Reserved columns
+    are filled by the pipeline; only the requested user fields come from the
+    model's records.
+    """
+    rows = []
+    base = {
+        "paper_key": paper_identity(paper),
+        "doi": paper.get("doi", ""),
+        "source": ", ".join(paper.get("sources", [])),
+        "pdf_file": pdf_file,
+        "pdf_source": pdf_source,
+        "evidence": "",
+        "evidence_page": "",
+    }
+    for index, record in enumerate(records, start=1):
+        row = dict(base)
+        row["row_index"] = index
+        for field in field_names:
+            row[field] = record.get(field, "") if isinstance(record, dict) else ""
+        rows.append(row)
+    return rows
 
 
 def run_search():
@@ -54,18 +250,7 @@ def run_search():
     papers = searchers.merge_papers(existing, new_papers)
     added = len(papers) - len(existing)
 
-    rows = [{
-        "source": ", ".join(p.get("sources", [])),
-        "title": p.get("title", ""),
-        "authors": p.get("authors", ""),
-        "doi": p.get("doi", ""),
-        "pmid": p.get("pmid", ""),
-        "pmcid": p.get("pmcid", ""),
-        "year": p.get("year", ""),
-        "journal": p.get("journal", ""),
-        "is_open_access": p.get("is_oa"),
-        "fulltext_url": p.get("fulltext_url", ""),
-    } for p in papers]
+    rows = [paper_to_row(p) for p in papers]
     writer.write_xlsx(config.SEARCH_RESULTS_XLSX, SEARCH_COLS, rows)
     print(f"Wrote {len(rows)} papers ({added} new) to {config.SEARCH_RESULTS_XLSX}")
     return papers
@@ -81,11 +266,14 @@ def _load_search_results(required=True):
         return []
     wb = load_workbook(config.SEARCH_RESULTS_XLSX, read_only=True)
     ws = wb.active
-    headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    headers = [
+        "" if c.value is None else str(c.value).strip()
+        for c in next(ws.iter_rows(min_row=1, max_row=1))
+    ]
     papers = []
     for row in ws.iter_rows(min_row=2, values_only=True):
         d = dict(zip(headers, row))
-        papers.append({
+        paper = {
             "sources": [s.strip() for s in str(d.get("source") or "").split(",") if s.strip()],
             "title": d.get("title") or "",
             "authors": d.get("authors") or "",
@@ -95,9 +283,14 @@ def _load_search_results(required=True):
             "year": d.get("year") or "",
             "journal": d.get("journal") or "",
             "abstract": d.get("abstract") or "",
-            "is_oa": d.get("is_open_access") == "yes",
+            "is_oa": d.get("is_open_access") in ("yes", "true", True, 1),
             "fulltext_url": d.get("fulltext_url") or "",
-        })
+        }
+        # Old search sheets predate paper_key: derive it in memory from
+        # pmid > doi > title. Never lose the stored value when it exists.
+        paper["paper_key"] = paper_identity({"paper_key": d.get("paper_key"), **paper})
+        papers.append(paper)
+    wb.close()
     return papers
 
 
@@ -127,18 +320,30 @@ def _closed_row(p, reason):
     }
 
 
-def run_extract(limit=None, papers=None):
+def run_extract(limit=None, papers=None, mode="records"):
+    mode = normalize_extraction_mode(mode)
     print("== Step 2/2: fetching + extracting ==")
+    print(f"Extraction mode: {MODE_LABELS[mode]} ({mode})")
     extractor.check_backend()
     cp = Checkpoint(config.CHECKPOINT_JSON)
 
     if papers is None:
         papers = _load_search_results()
 
+    # Migrate older workbooks in place (new reserved columns, DOI-based
+    # paper_key backfill) before any row is appended. Existing values and
+    # user-defined field columns are preserved.
+    writer.ensure_columns(config.EXTRACTED_XLSX, EXTRACT_COLS)
+    writer.backfill_paper_keys(config.EXTRACTED_XLSX)
+    instruction = make_instruction(mode=mode, extra=config.INSTRUCTION)
+    field_names = [e[0] for e in config.FIELDS]
+
     # dedup + skip already-done
     todo, seen = [], set()
     for p in papers:
-        k = searchers.paper_key(p)
+        k = paper_identity(p)
+        if not k:
+            continue
         if k in seen:
             continue
         seen.add(k)
@@ -150,7 +355,7 @@ def run_extract(limit=None, papers=None):
 
     print(f"{len(todo)} paper(s) to process.")
     for p in todo:
-        k = searchers.paper_key(p)
+        k = paper_identity(p)
         title = (p.get("title") or "")[:60]
         print(f"\n[{k}] {title}")
 
@@ -173,24 +378,20 @@ def run_extract(limit=None, papers=None):
 
         print(f"  -> got full text ({len(text)} chars) via {source}; extracting ...")
         try:
-            rows = extractor.extract(text)
+            rows = extractor.extract(
+                text,
+                fields=config.FIELDS,
+                instruction=instruction,
+            )
         except Exception as e:
             cp.mark(k, "error", error=str(e))
             print(f"  !! extract error: {e}")
             continue
 
-        rows = [r for r in rows if isinstance(r, dict)]
-        field_names = [e[0] for e in config.FIELDS]
-        out_rows = [
-            {
-                "doi": p.get("doi", ""),
-                "source": ", ".join(p.get("sources", [])),
-                "pdf_file": pdf_file,
-                "pdf_source": pdf_source,
-            }
-            | {f: r.get(f, "") for f in field_names}
-            for r in rows
-        ]
+        records = [r for r in rows if isinstance(r, dict)]
+        out_rows = build_extract_rows(
+            p, records, field_names, pdf_file=pdf_file, pdf_source=pdf_source
+        )
         writer.append_xlsx(config.EXTRACTED_XLSX, EXTRACT_COLS, out_rows)
 
         # Rule 3: text was extractable but no PDF/preprint could be archived.
@@ -213,6 +414,12 @@ def parse_args():
     ap.add_argument("--extract-only", action="store_true", help="only fetch + extract from existing search results")
     ap.add_argument("--limit", type=int, default=None, help="max papers to extract (quick demo)")
     ap.add_argument("--reset", action="store_true", help="clear the resume checkpoint before running")
+    ap.add_argument(
+        "--mode",
+        choices=EXTRACTION_MODES,
+        default=getattr(config, "EXTRACTION_MODE", "records"),
+        help="extraction mode: individual records (default) or table rows",
+    )
     return ap.parse_args()
 
 
@@ -223,12 +430,12 @@ def main():
         print("Checkpoint cleared.")
 
     if args.extract_only:
-        run_extract(limit=args.limit)
+        run_extract(limit=args.limit, mode=args.mode)
     elif args.search_only:
         run_search()
     else:
         papers = run_search()
-        run_extract(limit=args.limit, papers=papers)
+        run_extract(limit=args.limit, papers=papers, mode=args.mode)
 
 
 if __name__ == "__main__":

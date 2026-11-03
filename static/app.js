@@ -978,15 +978,51 @@ async function doSearch() {
   }
 }
 
+const RESERVED_COLUMNS = new Set([
+  "paper_key", "row_index", "evidence", "evidence_page", "pdf_file", "pdf_source",
+  "doi", "source",
+]);
+
+function parseColumnInput(value) {
+  const seen = new Map();
+  const reserved = [];
+  const duplicates = [];
+  value.split(",").map(s => s.trim()).filter(Boolean).forEach(name => {
+    const key = name.toLowerCase();
+    if (RESERVED_COLUMNS.has(key)) {
+      if (!reserved.includes(name)) reserved.push(name);
+      return;
+    }
+    if (seen.has(key)) {
+      if (!duplicates.includes(name)) duplicates.push(name);
+      return;
+    }
+    seen.set(key, name);
+  });
+  const errors = [];
+  if (reserved.length) {
+    errors.push("These column names are reserved and added automatically: " + reserved.join(", "));
+  }
+  if (duplicates.length) {
+    errors.push("Duplicate column names: " + duplicates.join(", "));
+  }
+  return { columns: [...seen.values()], errors };
+}
+
 async function doExtract() {
   setBanner("");
   const goal = document.getElementById("goal").value.trim();
-  const columns = document.getElementById("columns").value
-    .split(",").map(s => s.trim()).filter(Boolean);
+  const parsed = parseColumnInput(document.getElementById("columns").value);
+  if (parsed.errors.length) { setBanner(parsed.errors.join(" "), "error"); return; }
+  const mode = document.getElementById("extraction-mode").value || "records";
   if (!goal) { setBanner("Describe what data you want to extract.", "error"); return; }
 
   try {
-    const { job_id } = await postJSON("/api/extract", { goal, columns });
+    const { job_id } = await postJSON("/api/extract", {
+      goal,
+      columns: parsed.columns,
+      mode,
+    });
     setBusy(true);
     showProgress(true);
     pollJob(job_id);
@@ -1016,7 +1052,8 @@ function pollJob(jobId) {
         if (job.result && job.result.added !== undefined) {
           setBanner(`Search finished: ${job.result.total} papers.`, "ok");
         } else if (job.result && job.result.extracted !== undefined) {
-          setBanner(`Extraction finished: ${job.result.extracted} row(s) extracted, ${job.result.closed} paper(s) closed.`, "ok");
+          const modeLabel = job.result.mode === "table" ? "table rows" : "individual records";
+          setBanner(`Extraction finished (${modeLabel}): ${job.result.extracted} row(s) extracted, ${job.result.closed} paper(s) closed.`, "ok");
         }
       } else if (job.status === "error") {
         clearInterval(pollTimer);
@@ -1052,7 +1089,124 @@ function renderProgress(job) {
   log.scrollTop = log.scrollHeight;
 }
 
-/* ---------- results ---------- */
+/* ---------- results: tabs, grouping, selection ---------- */
+
+let activeResultsTab = "search";
+let selectedData = { groupKey: "", rowId: "", paper: null, row: null };
+
+function cleanValue(value) {
+  return value === null || value === undefined ? "" : String(value).trim();
+}
+
+function rowObject(header, values) {
+  const obj = {};
+  header.forEach((name, i) => { obj[name] = values[i] === undefined ? "" : values[i]; });
+  return obj;
+}
+
+function pmidKey(obj) {
+  const pmid = cleanValue(obj.pmid);
+  return pmid ? "pmid:" + pmid : "";
+}
+
+function doiKey(obj) {
+  const doi = cleanValue(obj.doi).toLowerCase();
+  return doi ? "doi:" + doi : "";
+}
+
+function titleKey(obj) {
+  const title = cleanValue(obj.title).replace(/\s+/g, " ").toLowerCase();
+  return title ? "title:" + title : "";
+}
+
+function canonicalKey(obj) {
+  return cleanValue(obj.paper_key) || pmidKey(obj) || doiKey(obj) || titleKey(obj) || "";
+}
+
+function searchKeys(obj) {
+  const keys = [];
+  const add = k => { if (k && !keys.includes(k)) keys.push(k); };
+  add(cleanValue(obj.paper_key));
+  add(pmidKey(obj));
+  add(doiKey(obj));
+  add(titleKey(obj));
+  return keys;
+}
+
+// Extracted rows have no title column of their own. Only real identities may
+// link them: stored paper_key, PMID or DOI. Everything else is "unlinked".
+function extractedKeys(obj) {
+  const keys = [];
+  const add = k => { if (k && !keys.includes(k)) keys.push(k); };
+  add(cleanValue(obj.paper_key));
+  add(pmidKey(obj));
+  add(doiKey(obj));
+  return keys;
+}
+
+function buildSearchIndex(sheet) {
+  const index = new Map();
+  if (!sheet) return index;
+  const header = sheet.header || [];
+  (sheet.rows || []).forEach(values => {
+    const obj = rowObject(header, values);
+    const key = canonicalKey(obj);
+    searchKeys(obj).forEach(candidate => {
+      if (!index.has(candidate)) index.set(candidate, { obj, key: key || candidate });
+    });
+  });
+  return index;
+}
+
+function findSearchMatch(obj, index) {
+  for (const key of extractedKeys(obj)) {
+    if (index.has(key)) return index.get(key);
+  }
+  return null;
+}
+
+function columnLabel(name) {
+  return name === "row_index" ? "#" : name;
+}
+
+function setResultsTab(name, focus) {
+  const tabs = [...document.querySelectorAll(".tab-btn")];
+  const available = tabs.some(t => t.dataset.tab === name && !t.hidden);
+  if (!available) name = "search";
+  tabs.forEach(btn => {
+    const active = btn.dataset.tab === name;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+    btn.tabIndex = active ? 0 : -1;
+    if (active && focus) btn.focus();
+  });
+  document.getElementById("tab-search").classList.toggle("hidden", name !== "search");
+  document.getElementById("tab-data").classList.toggle("hidden", name !== "data");
+  activeResultsTab = name;
+}
+
+function setupResultsTabs() {
+  const tablist = document.querySelector(".tabs");
+  if (!tablist) return;
+  tablist.addEventListener("click", (e) => {
+    const btn = e.target.closest(".tab-btn");
+    if (!btn || btn.hidden) return;
+    setResultsTab(btn.dataset.tab, false);
+  });
+  tablist.addEventListener("keydown", (e) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+    const tabs = [...tablist.querySelectorAll(".tab-btn:not([hidden])")];
+    if (!tabs.length) return;
+    let idx = tabs.findIndex(t => t.dataset.tab === activeResultsTab);
+    if (idx === -1) idx = 0;
+    if (e.key === "ArrowRight") idx = (idx + 1) % tabs.length;
+    else if (e.key === "ArrowLeft") idx = (idx - 1 + tabs.length) % tabs.length;
+    else if (e.key === "Home") idx = 0;
+    else if (e.key === "End") idx = tabs.length - 1;
+    e.preventDefault();
+    setResultsTab(tabs[idx].dataset.tab, true);
+  });
+}
 
 async function loadResults() {
   let data;
@@ -1067,24 +1221,53 @@ async function loadResults() {
 
   if (data.search) {
     document.getElementById("search-count").textContent = `(${data.search.rows.length})`;
-    renderTable("search-table", data.search.header, data.search.rows);
+    renderTable("search-table", data.search.header, data.search.rows, {
+      hidden: ["paper_key"],
+    });
+  } else {
+    document.getElementById("search-count").textContent = "";
+    document.getElementById("search-table").innerHTML = "";
   }
-  if (data.extracted) {
-    document.getElementById("extracted-count").textContent = `(${data.extracted.rows.length})`;
-    renderTable("extracted-table", data.extracted.header, data.extracted.rows);
+
+  const extracted = data.extracted;
+  const hasExtracted = !!(extracted && extracted.rows && extracted.rows.length);
+  const dataTab = document.getElementById("tab-btn-data");
+  dataTab.hidden = !hasExtracted;
+  document.getElementById("data-tab-count").textContent = hasExtracted
+    ? `(${extracted.rows.length})`
+    : "";
+
+  if (hasExtracted) {
+    renderDataGroups(extracted, buildSearchIndex(data.search));
+  } else {
+    document.getElementById("extracted-count").textContent = "";
+    document.getElementById("paper-group-count").textContent = "";
+    document.getElementById("data-groups").innerHTML = "";
+    clearSelectedData();
+    if (activeResultsTab === "data") setResultsTab("search", false);
   }
 }
 
-function renderTable(containerId, header, rows) {
+function renderTable(containerId, header, rows, options) {
+  const hidden = new Set((options && options.hidden) || []);
+  const columns = header
+    .map((name, index) => ({ name, index }))
+    .filter(col => !hidden.has(col.name));
   const container = document.getElementById(containerId);
   container.innerHTML = "";
+
+  if (!rows.length) {
+    container.appendChild(makeEl("p", "empty-note", "No rows yet."));
+    return;
+  }
+
   const table = document.createElement("table");
 
   const thead = document.createElement("thead");
   const hr = document.createElement("tr");
-  header.forEach(h => {
+  columns.forEach(col => {
     const th = document.createElement("th");
-    th.textContent = h;
+    th.textContent = columnLabel(col.name);
     hr.appendChild(th);
   });
   thead.appendChild(hr);
@@ -1094,12 +1277,12 @@ function renderTable(containerId, header, rows) {
   const cap = 300;
   rows.slice(0, cap).forEach(r => {
     const tr = document.createElement("tr");
-    header.forEach((h, i) => {
+    columns.forEach(col => {
       const td = document.createElement("td");
-      let v = r[i];
+      let v = r[col.index];
       if (v === null || v === undefined) v = "";
       v = String(v);
-      if (h === "is_open_access") {
+      if (col.name === "is_open_access") {
         td.className = v === "yes" ? "oa-yes" : "oa-no";
         v = v === "yes" ? "open" : (v === "no" ? "closed" : "");
       }
@@ -1117,6 +1300,251 @@ function renderTable(containerId, header, rows) {
     note.textContent = `Showing first ${cap} of ${rows.length} rows — download the Excel for everything.`;
     container.appendChild(note);
   }
+}
+
+function groupExtractedRows(extracted, searchIndex) {
+  const header = extracted.header || [];
+  const groups = new Map();
+  const unlinkedKey = "__unlinked__";
+
+  (extracted.rows || []).forEach((values, rawIndex) => {
+    const obj = rowObject(header, values);
+    const match = findSearchMatch(obj, searchIndex);
+    const keys = extractedKeys(obj);
+    const key = match ? (match.key || keys[0]) : (keys[0] || "");
+    const groupKey = key || unlinkedKey;
+
+    if (!groups.has(groupKey)) {
+      groups.set(groupKey, {
+        key: groupKey,
+        unlinked: groupKey === unlinkedKey,
+        paper: match ? match.obj : null,
+        rows: [],
+      });
+    }
+    groups.get(groupKey).rows.push({
+      obj,
+      rawIndex,
+      displayRow: cleanValue(obj.row_index) || String(rawIndex + 2),
+    });
+  });
+
+  return groups;
+}
+
+function groupTitle(group) {
+  if (group.unlinked) return "Unlinked rows";
+  if (group.paper) return cleanValue(group.paper.title) || "Untitled paper";
+  if (group.key.startsWith("title:")) return group.key.slice(6);
+  return "Paper not found in the current search results";
+}
+
+function renderDataGroups(extracted, searchIndex) {
+  const groups = groupExtractedRows(extracted, searchIndex);
+  const container = document.getElementById("data-groups");
+  container.innerHTML = "";
+
+  const totalRows = (extracted.rows || []).length;
+  document.getElementById("extracted-count").textContent =
+    `${totalRows} extracted row${totalRows === 1 ? "" : "s"}`;
+  document.getElementById("paper-group-count").textContent =
+    `${groups.size} paper group${groups.size === 1 ? "" : "s"}`;
+
+  if (!groups.size) {
+    container.appendChild(makeEl("p", "empty-note", "No extracted rows yet."));
+    clearSelectedData();
+    return;
+  }
+
+  const header = (extracted.header || []).filter(name => name !== "paper_key");
+  const cap = 300;
+  let shown = 0;
+  let selectedStillVisible = false;
+
+  groups.forEach(group => {
+    if (shown >= cap) return;
+    const section = document.createElement("section");
+    section.className = "data-group" + (group.unlinked ? " unlinked" : "");
+
+    const head = document.createElement("div");
+    head.className = "data-group-head";
+    const heading = document.createElement("div");
+    heading.className = "data-group-heading";
+
+    const title = makeEl("h4", "data-group-title", groupTitle(group));
+    heading.appendChild(title);
+
+    if (group.paper) {
+      const meta = [
+        cleanValue(group.paper.journal),
+        cleanValue(group.paper.year),
+        cleanValue(group.paper.source),
+      ].filter(Boolean).join(" · ");
+      if (meta) heading.appendChild(makeEl("p", "data-group-meta", meta));
+    }
+
+    const keyText = group.unlinked ? "" : group.key;
+    if (keyText) heading.appendChild(makeEl("code", "data-group-key", keyText));
+    head.appendChild(heading);
+    head.appendChild(makeEl(
+      "span",
+      "data-group-count",
+      `${group.rows.length} row${group.rows.length === 1 ? "" : "s"}`
+    ));
+    section.appendChild(head);
+
+    const wrap = document.createElement("div");
+    wrap.className = "table-wrap data-table-wrap";
+    const table = document.createElement("table");
+    const thead = document.createElement("thead");
+    const hr = document.createElement("tr");
+    header.forEach(name => {
+      const th = document.createElement("th");
+      th.textContent = columnLabel(name);
+      hr.appendChild(th);
+    });
+    thead.appendChild(hr);
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+    group.rows.slice(0, Math.max(0, cap - shown)).forEach(rowState => {
+      const tr = document.createElement("tr");
+      tr.className = "data-row";
+      const rowId = group.key + "::" + rowState.rawIndex;
+      tr.dataset.rowId = rowId;
+      tr.tabIndex = 0;
+      tr.setAttribute("role", "button");
+      tr.setAttribute("aria-label", `Select row ${rowState.displayRow} from ${groupTitle(group)}`);
+      if (selectedData.rowId === rowId) {
+        tr.classList.add("selected");
+        selectedStillVisible = true;
+      }
+
+      header.forEach(name => {
+        const td = document.createElement("td");
+        td.textContent = cleanValue(rowState.obj[name]);
+        tr.appendChild(td);
+      });
+      tr.addEventListener("click", () => selectDataRow(group, rowState, tr));
+      tr.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          selectDataRow(group, rowState, tr);
+        }
+      });
+      tbody.appendChild(tr);
+      shown += 1;
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    section.appendChild(wrap);
+    container.appendChild(section);
+  });
+
+  if (totalRows > cap) {
+    const note = document.createElement("p");
+    note.className = "muted";
+    note.textContent = `Showing first ${cap} of ${totalRows} rows — download the Excel for everything.`;
+    container.appendChild(note);
+  }
+
+  if (selectedData.rowId && !selectedStillVisible) clearSelectedData();
+  else if (selectedData.rowId) renderSelectionDetails();
+}
+
+function selectDataRow(group, rowState, tr) {
+  document.querySelectorAll(".data-row.selected").forEach(el => el.classList.remove("selected"));
+  tr.classList.add("selected");
+  selectedData = {
+    groupKey: group.key,
+    rowId: group.key + "::" + rowState.rawIndex,
+    paper: group.paper,
+    row: rowState.obj,
+    rowNumber: rowState.displayRow,
+    groupTitle: groupTitle(group),
+  };
+  renderSelectionDetails();
+}
+
+function clearSelectedData() {
+  selectedData = { groupKey: "", rowId: "", paper: null, row: null };
+  document.querySelectorAll(".data-row.selected").forEach(el => el.classList.remove("selected"));
+  const placeholder = document.getElementById("pdf-placeholder");
+  const details = document.getElementById("selection-details");
+  if (placeholder) placeholder.classList.remove("hidden");
+  if (details) {
+    details.classList.add("hidden");
+    details.innerHTML = "";
+  }
+}
+
+function renderSelectionDetails() {
+  const placeholder = document.getElementById("pdf-placeholder");
+  const details = document.getElementById("selection-details");
+  if (!placeholder || !details) return;
+  if (!selectedData.rowId) { clearSelectedData(); return; }
+
+  placeholder.classList.add("hidden");
+  details.classList.remove("hidden");
+  details.innerHTML = "";
+
+  const paper = selectedData.paper || {};
+  details.appendChild(makeEl("p", "selection-eyebrow", "Selected paper"));
+  details.appendChild(makeEl(
+    "h3",
+    "selection-title",
+    selectedData.groupTitle || "Selected paper"
+  ));
+
+  const meta = [
+    cleanValue(paper.journal),
+    cleanValue(paper.year),
+    cleanValue(paper.source),
+  ].filter(Boolean).join(" · ");
+  if (meta) details.appendChild(makeEl("p", "selection-meta", meta));
+
+  const facts = document.createElement("dl");
+  facts.className = "selection-facts";
+  const addFact = (label, value) => {
+    if (!value) return;
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    facts.appendChild(dt);
+    facts.appendChild(dd);
+  };
+  addFact("Paper key", selectedData.groupKey === "__unlinked__" ? "unlinked" : selectedData.groupKey);
+  addFact("Row", selectedData.rowNumber);
+  addFact("DOI", cleanValue(selectedData.row.doi));
+  details.appendChild(facts);
+
+  const evidence = document.createElement("div");
+  evidence.className = "evidence-placeholder";
+  evidence.appendChild(makeEl("p", "field-label", "Evidence"));
+  const evidenceText = cleanValue(selectedData.row.evidence);
+  const page = cleanValue(selectedData.row.evidence_page);
+  if (evidenceText || page) {
+    if (evidenceText) evidence.appendChild(makeEl("p", "evidence-text", evidenceText));
+    if (page) evidence.appendChild(makeEl("p", "muted", "Page: " + page));
+  } else {
+    evidence.appendChild(makeEl(
+      "p",
+      "muted",
+      "Evidence snippets and page numbers will appear here in a later update."
+    ));
+  }
+  details.appendChild(evidence);
+
+  const pdfNote = document.createElement("div");
+  pdfNote.className = "pdf-slot";
+  pdfNote.appendChild(makeEl("p", "pdf-slot-title", "Source PDF"));
+  pdfNote.appendChild(makeEl(
+    "p",
+    "muted",
+    "PDF viewing and annotation will appear in this space."
+  ));
+  details.appendChild(pdfNote);
 }
 
 function downloadFile(name) {
@@ -1164,6 +1592,7 @@ document.getElementById("suggest-all").onclick = suggestAllTerms;
 
 window.addEventListener("DOMContentLoaded", async () => {
   bindNumericInputs();
+  setupResultsTabs();
   queryModel.addTerm(queryModel.root);
   queryModel.addTerm(queryModel.root);
   renderQuery();
