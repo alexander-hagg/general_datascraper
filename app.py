@@ -26,6 +26,7 @@ from openpyxl import load_workbook
 import config
 import extractor
 import fetcher
+import figures
 import filters
 import history
 import local_pdfs
@@ -346,6 +347,15 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None,
                 Path(path).unlink()
         Checkpoint(config.CHECKPOINT_JSON).reset()
         local_pdfs.write_index(papers, replace=True)
+        # Figures belong to the previous dataset too: clear the index, xlsx and
+        # cached PNGs so stale thumbnails can never appear in the new gallery.
+        try:
+            cleared = figures.clear()
+            if (cleared or {}).get("warning"):
+                job["log"].append(f"Warning: {cleared['warning']}")
+        except Exception as exc:  # noqa: BLE001 - figure cleanup is best-effort
+            app.logger.warning("Could not clear figure gallery: %s", exc)
+            job["log"].append(f"Warning: could not clear old figures: {exc}")
         job["result"] = {
             "papers": rows,
             "added": len(rows),
@@ -459,6 +469,8 @@ def _run_extract_job(job, goal, columns, mode="records"):
         n_extracted = n_closed = 0
         n_evidence_located = n_evidence_unresolved = 0
         n_annotation_warnings = 0
+        n_figures_saved = n_figure_duplicates = n_figures_capped = 0
+        n_figure_warnings = 0
         first_write = True
         for i, p in enumerate(todo):
             k = paper_identity(p)
@@ -524,6 +536,34 @@ def _run_extract_job(job, goal, columns, mode="records"):
                     n_annotation_warnings += 1
                     job["log"].append(f"   !! evidence warning: {exc}")
 
+            # Figure screenshots are independent of evidence and of the number
+            # of extracted rows. Best-effort: never fail the extraction job.
+            if getattr(config, "FIGURES_ENABLED", True) and pdf.get("path"):
+                try:
+                    figure_summary = figures.process_paper(
+                        pdf.get("path"),
+                        k,
+                        title=p.get("title", ""),
+                        pdf_file=pdf_file,
+                        pdf_source=pdf_source,
+                    )
+                    n_figures_saved += int(
+                        (figure_summary or {}).get("saved") or 0
+                    )
+                    n_figure_duplicates += int(
+                        (figure_summary or {}).get("duplicates") or 0
+                    )
+                    if (figure_summary or {}).get("capped"):
+                        n_figures_capped += 1
+                    if (figure_summary or {}).get("warning"):
+                        n_figure_warnings += 1
+                    message = figures.summary_message(figure_summary)
+                    if message:
+                        job["log"].append(f"   -> {message}")
+                except Exception as exc:  # noqa: BLE001 - never fail extraction
+                    n_figure_warnings += 1
+                    job["log"].append(f"   !! figure warning: {exc}")
+
             if out_rows:
                 if fresh_output and first_write:
                     writer.write_xlsx(config.EXTRACTED_XLSX, extract_cols, out_rows)
@@ -554,6 +594,10 @@ def _run_extract_job(job, goal, columns, mode="records"):
             "evidence_located": n_evidence_located,
             "evidence_unresolved": n_evidence_unresolved,
             "annotation_warnings": n_annotation_warnings,
+            "figures_saved": n_figures_saved,
+            "figure_duplicates": n_figure_duplicates,
+            "figures_capped": n_figures_capped,
+            "figure_warnings": n_figure_warnings,
         }
         job["status"] = "done"
         job["log"].append(f"Done: {n_extracted} row(s) extracted, {n_closed} paper(s) closed.")
@@ -921,6 +965,14 @@ def _annotation_summary():
         return {}
 
 
+def _figure_list(paper_key=None):
+    """Never let a corrupt/missing figure index break a results endpoint."""
+    try:
+        return figures.api_list(paper_key)
+    except Exception:
+        return []
+
+
 @app.route("/api/results")
 def api_results():
     return jsonify({
@@ -928,7 +980,32 @@ def api_results():
         "extracted": _sheet_with_paper_keys(_read_xlsx(config.EXTRACTED_XLSX)),
         "closed": _read_xlsx(config.CLOSED_SOURCE_XLSX),
         "annotations": _annotation_summary(),
+        "figures": _figure_list(),
     })
+
+
+@app.route("/api/figures")
+def api_figures():
+    """List figure metadata, optionally filtered by ``?paper_key=``."""
+    paper_key = (request.args.get("paper_key") or "").strip()
+    return jsonify({"figures": _figure_list(paper_key or None)})
+
+
+@app.route("/api/figure/<figure_id>")
+def api_figure(figure_id):
+    """Serve one cached figure PNG by index id.
+
+    Only ids present in output/figures/index.json are accepted, and the stored
+    relative path is validated under FIGURES_DIR. No caller-supplied filename
+    or path is ever used, so this route cannot serve arbitrary files.
+    """
+    try:
+        path = figures.resolve_figure_path(figure_id)
+    except Exception:
+        path = None
+    if path is None:
+        abort(404)
+    return send_file(str(path), mimetype="image/png", as_attachment=False)
 
 
 @app.route("/api/annotated-pdf/<path:paper_key>")
@@ -975,6 +1052,7 @@ def download(name):
         "search_results.xlsx": config.SEARCH_RESULTS_XLSX,
         "extracted_data.xlsx": config.EXTRACTED_XLSX,
         "closed_source_papers.xlsx": config.CLOSED_SOURCE_XLSX,
+        "figures.xlsx": config.FIGURES_XLSX,
     }
     path = mapping.get(name)
     if not path or not Path(path).exists():

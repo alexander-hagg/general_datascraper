@@ -342,6 +342,11 @@ class SearchJobYearRangeTests(unittest.TestCase):
                  mock.patch.object(
                      web.config, "LOCAL_PDF_INDEX_JSON", tmp / "local_pdfs.json"
                  ), \
+                 mock.patch.object(web.config, "FIGURES_DIR", tmp / "figures"), \
+                 mock.patch.object(
+                     web.config, "FIGURES_INDEX_JSON", tmp / "figures" / "index.json"
+                 ), \
+                 mock.patch.object(web.config, "FIGURES_XLSX", tmp / "figures.xlsx"), \
                  mock.patch.object(web, "apply_settings", lambda s: None), \
                  mock.patch.object(
                      web, "load_settings",

@@ -33,6 +33,21 @@ def read_sheet(path):
     return rows
 
 
+def patch_figures_paths(case, root):
+    """Keep figure detection/cleanup inside a temp dir during a test."""
+    root = Path(root)
+    fig_dir = root / "figures"
+    mapping = {
+        "FIGURES_DIR": fig_dir,
+        "FIGURES_INDEX_JSON": fig_dir / "index.json",
+        "FIGURES_XLSX": root / "figures.xlsx",
+    }
+    for name, value in mapping.items():
+        patcher = mock.patch.object(web.config, name, value)
+        patcher.start()
+        case.addCleanup(patcher.stop)
+
+
 def make_pdf(path, pages):
     """Create a small real PDF; `pages` is a list of lists of text lines."""
     doc = pymupdf.open()
@@ -86,7 +101,7 @@ class ResultsApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertEqual(
-            set(payload), {"search", "extracted", "closed", "annotations"}
+            set(payload), {"search", "extracted", "closed", "annotations", "figures"}
         )
         self.assertEqual(payload["annotations"], {})
         self.assertIsNone(payload["closed"])
@@ -576,6 +591,9 @@ class SearchJobJournalTests(unittest.TestCase):
         patcher = mock.patch.object(web.history, "record")
         patcher.start()
         self.addCleanup(patcher.stop)
+        self._fig_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._fig_tmp.cleanup)
+        patch_figures_paths(self, self._fig_tmp.name)
 
     def _job(self):
         return {
@@ -669,6 +687,9 @@ class SearchJobLocalTests(unittest.TestCase):
         patcher = mock.patch.object(web.history, "record")
         patcher.start()
         self.addCleanup(patcher.stop)
+        self._fig_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._fig_tmp.cleanup)
+        patch_figures_paths(self, self._fig_tmp.name)
 
     def _job(self):
         return {
@@ -899,6 +920,7 @@ class SearchJobHistoryTests(unittest.TestCase):
         )
         self._path_patch.start()
         self.addCleanup(self._path_patch.stop)
+        patch_figures_paths(self, self.dir)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -1183,7 +1205,7 @@ class AnnotationsApiTests(unittest.TestCase):
             payload = self.client.get("/api/results").get_json()
 
         self.assertEqual(
-            set(payload), {"search", "extracted", "closed", "annotations"}
+            set(payload), {"search", "extracted", "closed", "annotations", "figures"}
         )
         annotation = payload["annotations"][self.key]
         self.assertTrue(annotation["available"])
@@ -1202,6 +1224,9 @@ class ExtractJobEvidenceTests(unittest.TestCase):
         patcher = mock.patch.object(web.history, "record")
         patcher.start()
         self.addCleanup(patcher.stop)
+        self._fig_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._fig_tmp.cleanup)
+        patch_figures_paths(self, self._fig_tmp.name)
 
     def _job(self):
         return {
@@ -1291,6 +1316,13 @@ class DataTabViewerMarkupTests(unittest.TestCase):
         self.assertIn("/api/annotated-pdf/", script)
         self.assertIn("data.annotations", script)
         self.assertIn("evidenceMetadataForRow", script)
+        self.assertIn('id="figures-gallery"', template)
+        self.assertIn('id="figure-modal"', template)
+        self.assertIn('id="dl-figures"', template)
+        self.assertIn("renderFigures", script)
+        self.assertIn("data.figures", script)
+        self.assertIn("/api/figure/", script)
+        self.assertIn("figures.xlsx", template)
 
 
 if __name__ == "__main__":

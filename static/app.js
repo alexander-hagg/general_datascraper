@@ -1547,7 +1547,8 @@ async function loadResults() {
     return;
   }
   const card = document.getElementById("results-card");
-  const hasAny = data.search || data.extracted || data.closed;
+  const figureItems = Array.isArray(data.figures) ? data.figures : [];
+  const hasAny = data.search || data.extracted || data.closed || figureItems.length > 0;
   card.classList.toggle("hidden", !hasAny);
 
   if (data.search) {
@@ -1562,11 +1563,12 @@ async function loadResults() {
 
   const extracted = data.extracted;
   const hasExtracted = !!(extracted && extracted.rows && extracted.rows.length);
+  const hasFigures = figureItems.length > 0;
   const dataTab = document.getElementById("tab-btn-data");
-  dataTab.hidden = !hasExtracted;
+  dataTab.hidden = !(hasExtracted || hasFigures);
   document.getElementById("data-tab-count").textContent = hasExtracted
     ? `(${extracted.rows.length})`
-    : "";
+    : (hasFigures ? `(${figureItems.length} figures)` : "");
 
   if (hasExtracted) {
     renderDataGroups(
@@ -1577,10 +1579,16 @@ async function loadResults() {
   } else {
     document.getElementById("extracted-count").textContent = "";
     document.getElementById("paper-group-count").textContent = "";
-    document.getElementById("data-groups").innerHTML = "";
+    const groups = document.getElementById("data-groups");
+    groups.innerHTML = "";
+    if (hasFigures) {
+      groups.appendChild(makeEl("p", "empty-note", "No extracted rows yet — figures only."));
+    }
     clearSelectedData();
-    if (activeResultsTab === "data") setResultsTab("search", false);
+    if (!hasFigures && activeResultsTab === "data") setResultsTab("search", false);
   }
+
+  renderFigures(figureItems);
 }
 
 function renderTable(containerId, header, rows, options) {
@@ -1788,6 +1796,185 @@ function renderDataGroups(extracted, searchIndex, annotations) {
 
   if (selectedData.rowId && !selectedStillVisible) clearSelectedData();
   else if (selectedData.rowId) renderSelectionDetails();
+}
+
+/* ---------- figure gallery / lightbox ---------- */
+
+let figureModalPreviousFocus = null;
+
+function figureImageUrl(id) {
+  return "/api/figure/" + encodeURIComponent(String(id || ""));
+}
+
+function shortCaption(text, limit) {
+  const value = cleanValue(text);
+  if (!value) return "";
+  const cap = limit || 180;
+  return value.length > cap ? value.slice(0, cap - 1).trimEnd() + "…" : value;
+}
+
+function figureKindLabel(kind) {
+  if (kind === "image") return "embedded image";
+  if (kind === "page") return "full page (caption only)";
+  return "caption crop";
+}
+
+function renderFigures(figures) {
+  const section = document.getElementById("figures-section");
+  const gallery = document.getElementById("figures-gallery");
+  const count = document.getElementById("figures-count");
+  const actionButton = document.getElementById("dl-figures");
+  if (!section || !gallery || !count) return;
+
+  const items = (Array.isArray(figures) ? figures : [])
+    .filter(fig => fig && fig.id);
+  const hasFigures = items.length > 0;
+  section.classList.toggle("hidden", !hasFigures);
+  if (actionButton) actionButton.classList.toggle("hidden", !hasFigures);
+  count.textContent = hasFigures ? `(${items.length})` : "";
+  gallery.innerHTML = "";
+  if (!hasFigures) {
+    closeFigureModal();
+    return;
+  }
+
+  // Group thumbnails by paper, preserving the API's sorted order.
+  const groups = new Map();
+  items.forEach(fig => {
+    const key = cleanValue(fig.paper_key) || "__paper__";
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        title: cleanValue(fig.title) || (key === "__paper__" ? "Unknown paper" : key),
+        figures: [],
+      });
+    }
+    groups.get(key).figures.push(fig);
+  });
+
+  groups.forEach(group => {
+    const groupEl = document.createElement("section");
+    groupEl.className = "figure-group";
+
+    const head = document.createElement("div");
+    head.className = "figure-group-head";
+    head.appendChild(makeEl("h4", "figure-group-title", group.title));
+    head.appendChild(makeEl(
+      "span",
+      "figure-group-count",
+      `${group.figures.length} figure${group.figures.length === 1 ? "" : "s"}`
+    ));
+    if (group.key !== "__paper__") {
+      head.appendChild(makeEl("code", "figure-group-key", group.key));
+    }
+    groupEl.appendChild(head);
+
+    const grid = document.createElement("div");
+    grid.className = "figure-grid";
+    group.figures.forEach(fig => {
+      const label = cleanValue(fig.label) || "Figure";
+      const page = cleanValue(fig.page);
+      const caption = shortCaption(fig.caption, 180);
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "figure-thumb";
+      button.setAttribute(
+        "aria-label",
+        `Open ${label}${page ? " (page " + page + ")" : ""} from ${group.title}`
+      );
+
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.src = figureImageUrl(fig.id);
+      img.alt = `${label}${page ? ", page " + page : ""} — ${group.title}`;
+      img.addEventListener("error", () => button.classList.add("broken"));
+
+      const body = document.createElement("div");
+      body.className = "figure-thumb-body";
+      body.appendChild(makeEl("p", "figure-thumb-label", label));
+      body.appendChild(makeEl(
+        "p",
+        "figure-thumb-meta",
+        [page ? `Page ${page}` : "", figureKindLabel(fig.kind)].filter(Boolean).join(" · ")
+      ));
+      if (caption) {
+        const captionEl = makeEl("p", "figure-thumb-caption", caption);
+        captionEl.title = cleanValue(fig.caption);
+        body.appendChild(captionEl);
+      }
+
+      button.appendChild(img);
+      button.appendChild(body);
+      button.addEventListener("click", () => openFigureModal(fig, group.title));
+      grid.appendChild(button);
+    });
+
+    groupEl.appendChild(grid);
+    gallery.appendChild(groupEl);
+  });
+}
+
+function openFigureModal(fig, paperTitle) {
+  const modal = document.getElementById("figure-modal");
+  const image = document.getElementById("figure-modal-image");
+  if (!modal || !image || !fig) return;
+  const url = figureImageUrl(fig.id);
+  const label = cleanValue(fig.label) || "Figure";
+  const page = cleanValue(fig.page);
+
+  figureModalPreviousFocus = document.activeElement;
+  image.src = url;
+  image.alt = `${label}${page ? ", page " + page : ""} — ${paperTitle || "paper"}`;
+
+  document.getElementById("figure-modal-label").textContent = label;
+  document.getElementById("figure-modal-title").textContent = paperTitle || "";
+  document.getElementById("figure-modal-meta").textContent = [
+    page ? `Page ${page}` : "",
+    figureKindLabel(fig.kind),
+  ].filter(Boolean).join(" · ");
+  document.getElementById("figure-modal-caption").textContent =
+    cleanValue(fig.caption) || "No caption text was found for this figure.";
+
+  const link = document.getElementById("figure-modal-link");
+  if (link) {
+    link.href = url;
+    link.hidden = false;
+  }
+  modal.classList.remove("hidden");
+  document.body.classList.add("figure-modal-open");
+  const close = document.getElementById("figure-modal-close");
+  if (close) close.focus({ preventScroll: true });
+}
+
+function closeFigureModal() {
+  const modal = document.getElementById("figure-modal");
+  if (!modal || modal.classList.contains("hidden")) return;
+  const image = document.getElementById("figure-modal-image");
+  modal.classList.add("hidden");
+  document.body.classList.remove("figure-modal-open");
+  if (image) {
+    image.removeAttribute("src");
+    image.alt = "";
+  }
+  if (figureModalPreviousFocus && typeof figureModalPreviousFocus.focus === "function") {
+    figureModalPreviousFocus.focus({ preventScroll: true });
+  }
+  figureModalPreviousFocus = null;
+}
+
+function setupFigureModal() {
+  const modal = document.getElementById("figure-modal");
+  if (!modal) return;
+  document.getElementById("figure-modal-close")?.addEventListener("click", closeFigureModal);
+  modal.querySelectorAll("[data-close-figure]").forEach(el => {
+    el.addEventListener("click", closeFigureModal);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !modal.classList.contains("hidden")) {
+      e.preventDefault();
+      closeFigureModal();
+    }
+  });
 }
 
 function evidenceMetadataForRow(annotation, row) {
@@ -2026,6 +2213,7 @@ HISTORY_KINDS.forEach(bindHistoryClear);
 window.addEventListener("DOMContentLoaded", async () => {
   bindNumericInputs();
   setupResultsTabs();
+  setupFigureModal();
   queryModel.addTerm(queryModel.root);
   queryModel.addTerm(queryModel.root);
   renderQuery();

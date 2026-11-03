@@ -7,4 +7,5 @@ output/local_pdfs.json
 output/prompt_history.json
 output/pdf_index.json
 output/annotated_pdfs/
+output/figures/
 output/*.xlsx
