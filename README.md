@@ -18,10 +18,66 @@ for → everything lands in an Excel file in the `output/` folder.
    A browser opens at http://127.0.0.1:5000 — that's the whole app.
 3. Search for papers, then click **Extract data** and describe what you want
    (e.g. *"every mutation tested and whether it increased or decreased function"*).
-4. Results are saved automatically in the `output/` folder. Use the
-   **📂 Open output folder** button in the app to jump straight there.
+4. Results are saved automatically in a run folder under `output/runs/`. Use the
+   **📂 Open output folder** button in the app to jump straight there (see
+   **Run folders and saved application state** below).
 
 That's it. The Excel files are the output; the browser is just the control panel.
+
+
+## Run folders and saved application state
+
+The web app keeps **one folder per search dataset** (a "run"), so an older
+search can be loaded later without mixing its papers with a newer topic:
+
+```
+output/runs/20261103-142501-a1b2/
+    state.json                  saved search/extraction form + counts
+    search_results.xlsx
+    extracted_data.xlsx
+    closed_source_papers.xlsx
+    checkpoint.json
+    local_pdfs.json
+    pdf_index.json
+    pdfs/
+    annotated_pdfs/
+    figures/
+    figures.xlsx
+```
+
+- **A new Search always starts a new run** (`search_results.xlsx` replacement
+  semantics: extraction rows, closed papers, checkpoint and figures in that new
+  folder start empty). Extract writes into the same folder as its search.
+- **Load an old run** in the **Runs** card to switch the results tables,
+  downloads and PDF viewer back to that folder. Loading only restores the form
+  and state — it never starts a search or extraction.
+- **Refresh search** (in the Runs card) searches again with the current form and
+  **merges** the new papers into the loaded run. Existing extracted rows, closed
+  papers, the checkpoint, annotations and figures are preserved. The journal
+  blocklist is applied to the merged paper set.
+- **Delete run** removes a non-active run folder after confirmation. The active
+  run cannot be deleted; load another run first, then delete the old one.
+- Search is one dataset, so a refresh does **not** create a second folder, and a
+  normal Search after loading an old run creates a new one.
+
+The saved `state.json` contains the boolean query tree, the rendered query, the
+**selected and "members selected" group checkbox paths**, websites, max results,
+year range, journal blocklist, local-folder settings, extraction goal/columns/
+mode, counts, timestamps, and the non-secret email/model settings. It never
+stores API keys, backend URLs or absolute output paths. The checkboxes are
+restored from tree positions rather than browser-generated ids, so a saved run
+looks the same after a reload.
+
+`output/active_run.json` is a small marker with the loaded run id. `web_settings.json`
+and `prompt_history.json` stay **global** (they are not copied into runs); the
+**📂 Open output folder** button opens the active run folder. If the marker is
+missing or corrupt, the app uses the newest valid run. On first startup after
+upgrading, existing global `output/` artifacts are copied (or hardlinked) once
+into a run called **Imported run**; the originals are never moved or deleted.
+
+`python app.py` and the start scripts enable run folders. The command-line
+interface (`python main.py`) intentionally keeps its legacy global `output/`
+paths and does not create or switch runs. All run/state files are git-ignored.
 
 
 ## Cancelling a running job

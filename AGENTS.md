@@ -1,14 +1,17 @@
 # AGENTS.md
 
 ScrapeLite: a local search → open-access full-text fetch → LLM extraction pipeline.
-Flask UI + CLI share one Python engine; results go to Excel files in `output/`.
+Flask UI + CLI share one Python engine; results go to Excel files in `output/`
+(the web app keeps one folder per search under `output/runs/`).
 No build step, package metadata, linter, or CI; unit tests live in `tests/`.
 
 ## Commands (Linux/macOS)
 
 - Use the project venv: `.venv/bin/python` (currently Python 3.13; scripts enforce >= 3.9).
 - Web app: `bash start.sh` or `.venv/bin/python app.py` → http://127.0.0.1:5000
-  (`start.sh` runs `setup.sh` automatically if the venv is missing).
+  (`start.sh` runs `setup.sh` automatically if the venv is missing). `app.py`'s
+  `__main__` block enables `config.RUNS_ENABLED` and calls
+  `runs.ensure_active_run()`; importing `app` (tests) leaves legacy paths active.
 - CLI: `.venv/bin/python main.py` (search + extract)
   - `--search-only`, `--extract-only` (needs existing `output/search_results.xlsx`),
     `--limit N`, `--reset` (clears `output/checkpoint.json`),
@@ -21,7 +24,8 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   When changing setup/start behavior or dry-run output, keep `setup.sh`,
   `setup.ps1`, `start.sh`, and `start.bat` in sync.
 - Tests: `.venv/bin/python -m unittest discover -s tests -v` (mocked, no network).
-  Smoke check: `.venv/bin/python -c "import app, main, searchers, pdf_annotations"`.
+  Smoke check: `.venv/bin/python -c "import app, main, runs, figures, pdf_annotations"`.
+  JS syntax: `node --check static/app.js`.
   `main.py --search-only` and any extraction/suggestions hit live services
   (PubMed/Europe PMC/Crossref, Ollama or the OpenAI-compatible endpoint).
 - Extraction and ✨ suggestions require Ollama running with the configured model
@@ -42,7 +46,37 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   paths, Flask host/port. The web Settings panel persists
   email/model/max-results/year range/local folder to
   `output/web_settings.json`; those values **override `config.py` at app
-  startup**.
+  startup**. `RUNS_ENABLED` (default `False`), `RUNS_DIR`
+  (`OUTPUT_DIR/"runs"`), `ACTIVE_RUN_JSON` and the runtime
+  `ACTIVE_RUN_DIR = None` drive per-run folders.
+- `runs.py`: per-search-dataset folders + savable state. A run id must match
+  `^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$` (no separators/absolute paths/`..`).
+  `create_run()` makes `RUNS_DIR/<timestamp>-<4hex>/` with
+  `state.json`, `pdfs/`, `annotated_pdfs/`, `figures/`; the run also owns
+  `search_results.xlsx`, `extracted_data.xlsx`, `closed_source_papers.xlsx`,
+  `checkpoint.json`, `local_pdfs.json`, `pdf_index.json`, `figures/index.json`
+  and `figures.xlsx`. `apply_run_paths()` repoints
+  `SEARCH_RESULTS_XLSX`, `CLOSED_SOURCE_XLSX`, `EXTRACTED_XLSX`,
+  `CHECKPOINT_JSON`, `LOCAL_PDF_INDEX_JSON`, `PDF_INDEX_JSON`,
+  `ANNOTATED_PDF_DIR`, `PDF_DIR`, `FIGURES_DIR`, `FIGURES_INDEX_JSON` and
+  `FIGURES_XLSX`, and sets `config.ACTIVE_RUN_DIR`; it never changes
+  `OUTPUT_DIR`, `PROMPT_HISTORY_JSON` or `app.SETTINGS_PATH`.
+  `apply_legacy_paths()` restores `OUTPUT_DIR/*` and clears `ACTIVE_RUN_DIR`.
+  `capture_paths()`/`restore_paths()` support search rollback.
+  State schema v1: `{schema_version, id, name, created_at, updated_at, status,
+  query:{tree,rendered,selected_paths,children_selected_paths}, sources,
+  max_results, year_from, year_to, excluded_journals, local_folder,
+  local_recursive, local_only, extraction:{goal,columns,mode},
+  settings:{email,model}, counts:{papers,extracted,closed,figures},
+  last_search_at, last_extract_at}`. Unknown keys (API keys, output paths) are
+  dropped. `list_runs()` returns metadata only, newest updated first; corrupt
+  states are skipped. The `output/active_run.json` marker holds
+  `{run_id, updated_at}`. `current_run_id()` verifies the state is readable.
+  `ensure_active_run()` prefers the marker, then the newest valid run, then a
+  one-time import of global artifacts into **Imported run** (copy/hardlink;
+  source files are never moved/deleted; `web_settings.json`,
+  `prompt_history.json` and `runs/` are not imported). Deleting the active run
+  clears the marker and restores legacy paths; the API refuses that deletion.
 - `local_pdfs.py`: local folder source. `scan_folder()` validates the folder,
   reads pypdf metadata plus a DOI from the first three pages, dedupes by DOI then
   normalized title, and copies/hardlinks each valid `%PDF-` into `config.PDF_DIR`
@@ -127,6 +161,23 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   treats only `running` as active. `POST /api/job/<id>/cancel` sets the job's
   `cancel_requested` flag under `JOB_LOCK` (404 unknown, 409 non-running) and the
   job body stops at its next cooperative check.
+  When `config.RUNS_ENABLED` is true, a normal `/api/search` creates a run and
+  applies its paths before scanning/network access; success writes the sheet,
+  clears extraction/closed/checkpoint/figures/local index inside that run, writes
+  counts/last_search_at and sets the active marker. Any cancel/error before the
+  dataset is complete restores the captured previous paths and deletes the
+  abandoned new folder. `merge:true` (Refresh search) requires an active run,
+  does not create a folder, merges by `paper_key`, applies the blocklist to the
+  merged set, writes the local index with `replace=False`, and preserves
+  extraction/closed/checkpoint/figure outputs. The job result adds `run_id`,
+  `merged` and `added`. `_run_extract_job` calls `ensure_active_run()` (never
+  creates one), saves extraction goal/columns/mode, then counts/last_extract_at
+  for done/cancelled/error. Run routes: `GET /api/runs`,
+  `GET /api/run`, `POST /api/runs/<id>/load`,
+  `POST /api/runs/<id>/delete`; load/delete return 409 while a job is running and
+  delete refuses the active run. `open_output` uses
+  `config.ACTIVE_RUN_DIR or config.OUTPUT_DIR`; `/download/<name>` and
+  `/api/results` keep reading dynamic config paths.
   `GET /api/annotated-pdf/<path:paper_key>` serves only keys in
   `output/pdf_index.json`, regenerating a missing annotation or falling back to
   the original PDF; unknown/invalid keys are 404. `GET /api/results` keeps
@@ -153,26 +204,48 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   `#progress-card` also hosts the `#cancel-job` button: it is visible only while
   a job is `running`, posts to the cancel endpoint, disables itself and shows
   `Cancelling…` when `cancel_requested` is true, and is reset/hidden for
-  `done`, `error` and `cancelled`.
+  `done`, `error` and `cancelled`. `#runs-card` (hidden unless `/api/runs`
+  reports `enabled`) lists runs, loads/refreshes/deletes them and drives
+  `/api/runs/<id>/load|delete`; page load calls `loadRuns({applyActive:true})`
+  after sources/settings and applies the active state without auto-running.
+  `doSearch({merge:true})` is Refresh search. `applyRunState()` restores query +
+  checkbox paths, sources, max results, years, journals, local folder,
+  extraction goal/columns/mode and email/model fields (not saved automatically).
+  `queryModel.pathForNode()`/`nodeAtPath()` use child-index paths;
+  `restore(tree, {preserveEmpty:true})` keeps empty nodes for run restores while
+  history keeps dropping them. `snapshotQuerySelection()` /
+  `restoreQuerySelection()` persist `selected_paths` and
+  `children_selected_paths`; state-2 groups re-add their descendants and call
+  `pruneSelection()`/`syncSelectionUI()`. `syncSelectionUI` checks a group box
+  when `selectedIds.has(id) || childrenSelectedGroups.has(id)`; preserve that
+  group-checkbox fix when editing selection code.
 
 ## Behavior that is easy to break
 
 - **CLI vs web search differ on purpose:** CLI search merges new results into the
-  existing `search_results.xlsx`; web search replaces the sheet and also deletes
-  `extracted_data.xlsx` + `closed_source_papers.xlsx` and resets the checkpoint
-  (a fresh dataset). Don't align them without deciding which behavior is wanted.
-  The local index follows the same rule: the web job always writes it with
-  `replace=True` (stale mappings cannot survive a replaced dataset), while a CLI
-  run that scans `--local-folder` writes the final merged set so retained papers
-  keep their mappings. The figure index follows it too: web search clears it
-  (`figures.clear()`), CLI search preserves it.
+  existing global `output/search_results.xlsx`; a normal web search creates a new
+  run folder, replaces that run's search sheet and deletes that run's
+  `extracted_data.xlsx` + `closed_source_papers.xlsx`, resets its checkpoint and
+  clears its figures (a fresh dataset). Web **Refresh search** (`merge:true`) is
+  the additive path and must keep the run's extraction/closed/checkpoint/figure
+  files. Don't align CLI and web without deciding which behavior is wanted.
+  The local index follows the same rule: a new web run writes it with
+  `replace=True` (stale mappings cannot survive a replaced dataset), Refresh
+  writes with `replace=False`, while a CLI run that scans `--local-folder` writes
+  the final merged set so retained papers keep their mappings. The figure index
+  follows it too: a new web search clears it (`figures.clear()`), CLI search and
+  web Refresh preserve it. When runs are disabled, the old web replace behavior
+  is unchanged on the global paths.
 - **Cancellation is cooperative and must preserve partial work:** the web
   Cancel button sets `cancel_requested`; it never kills a thread. `search()`
   checks between sources (and `search_all()` between queries) and raises
   `SearchCancelled`, which `_run_search_job()` maps to status `cancelled`, not
   `error`. Before writing/replacing anything, the search job checks again, so a
   cancelled search leaves the previous `search_results.xlsx`, extracted/closed
-  files, checkpoint, local index and figures untouched. `_run_extract_job()`
+  files, checkpoint, local index and figures untouched. With runs enabled, a
+  cancelled/failed **new** search also restores the previously captured paths and
+  deletes its abandoned new run folder; a cancelled **Refresh** keeps the active
+  run and its previous sheet. `_run_extract_job()`
   checks before each paper and again after the current one; the in-flight paper
   finishes and its rows/checkpoint/closed entry are saved, then the loop breaks.
   Unprocessed papers are never marked done, so a later Extract resumes them.
@@ -234,7 +307,9 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   {type:"group", op, children}]}` with **no node ids**; `queryModel.restore()`
   regenerates ids and ignores invalid/empty nodes. Selecting a previous search
   restores fields but never auto-runs; legacy entries without `query_tree` fall
-  back to one term containing the rendered query.
+  back to one term containing the rendered query. History stays global across
+  runs and uses the default `restore()` (drops empty nodes); run selection paths
+  are stored in the run state, not in prompt history.
 - Checkpoint skips `extracted` and `closed` papers; `error` entries retry.
   Web search resets it, CLI only with `--reset`.
 - **The year range is separate from the boolean query:** it is never
@@ -273,6 +348,15 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   (evidence/annotation index, git-ignored), `annotated_pdfs/` (cached
   highlighted copies, git-ignored), `figures/` (figure index + cached PNGs,
   git-ignored), `figures.xlsx` (figure metadata, covered by `output/*.xlsx`).
+  With runs enabled these same files live under `output/runs/<run-id>/`; the
+  global copies remain for CLI/legacy use. `output/active_run.json` is the
+  loaded-run marker and `output/runs/` is a dataset container; both are
+  git-ignored. `output/web_settings.json` stays global.
+- Run tests must patch `config.RUNS_ENABLED=True` plus temporary `RUNS_DIR`,
+  `ACTIVE_RUN_JSON` and `OUTPUT_DIR`, and restore `runs.capture_paths()` in
+  cleanup because `apply_run_paths()` mutates module-level config paths. The
+  existing suite relies on `RUNS_ENABLED=False` so all 262 original tests keep
+  using the global paths unchanged.
 
 ## Repository gotchas
 

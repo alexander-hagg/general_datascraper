@@ -31,6 +31,7 @@ import filters
 import history
 import local_pdfs
 import pdf_annotations
+import runs
 import searchers
 import suggester
 import writer
@@ -227,18 +228,169 @@ def _cancel_requested(job):
     return bool(job.get("cancel_requested"))
 
 
-def _mark_search_cancelled(job):
+def _runs_enabled():
+    return bool(getattr(config, "RUNS_ENABLED", False))
+
+
+def _run_name(query, local_folder):
+    """A readable run name: the query, else the local folder, else None."""
+    text = " ".join(str(query or "").split())
+    if text:
+        return text[:80]
+    folder = str(local_folder or "").strip()
+    if folder:
+        name = Path(folder).name or folder
+        return name[:80]
+    return None
+
+
+def _run_query_state(query, query_tree, query_selection):
+    selection = runs.sanitize_query_selection(query_selection)
+    return {
+        "tree": query_tree if isinstance(query_tree, dict) else None,
+        "rendered": str(query or ""),
+        "selected_paths": selection["selected_paths"],
+        "children_selected_paths": selection["children_selected_paths"],
+    }
+
+
+def _run_settings(settings):
+    """Only the two non-secret app settings are saved in a run state."""
+    return {
+        "email": str((settings or {}).get("email") or getattr(config, "NCBI_EMAIL", "")),
+        "model": str(
+            (settings or {}).get("model") or getattr(config, "OLLAMA_MODEL", "")
+        ),
+    }
+
+
+def _count_xlsx_rows(path):
+    """Data-row count for an xlsx sheet; None when it cannot be read."""
+    p = Path(path)
+    if not p.exists():
+        return 0
+    try:
+        wb = load_workbook(p, read_only=True)
+        try:
+            ws = wb.active
+            return max(0, int(ws.max_row or 1) - 1)
+        finally:
+            wb.close()
+    except Exception:
+        return None
+
+
+def _current_counts(run_id=None):
+    """Read the active run's artifact counts, keeping old values on errors."""
+    previous = {}
+    if run_id:
+        try:
+            state = runs.load_state(run_id) or {}
+            previous = state.get("counts") or {}
+        except Exception:
+            previous = {}
+
+    def count(key, reader):
+        try:
+            value = reader()
+        except Exception:
+            value = None
+        if value is None:
+            try:
+                return int(previous.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+        return int(value)
+
+    return {
+        "papers": count("papers", lambda: _count_xlsx_rows(config.SEARCH_RESULTS_XLSX)),
+        "extracted": count("extracted", lambda: _count_xlsx_rows(config.EXTRACTED_XLSX)),
+        "closed": count("closed", lambda: _count_xlsx_rows(config.CLOSED_SOURCE_XLSX)),
+        "figures": count("figures", lambda: len(_figure_list())),
+    }
+
+
+def _save_run_state(job, run_id, **changes):
+    """Best-effort state update: never lose search/extraction output over it."""
+    if not run_id:
+        return None
+    try:
+        return runs.update_state(run_id, **changes)
+    except Exception as exc:  # noqa: BLE001 - state is a convenience
+        message = f"Could not save run state: {exc}"
+        app.logger.warning(message)
+        job["log"].append(f"Warning: {message}")
+        return None
+
+
+def _finish_extract_run(job, run_id, status):
+    """Record extraction bookkeeping on the active run after any outcome."""
+    if not run_id:
+        return
+    _save_run_state(
+        job,
+        run_id,
+        status=status,
+        counts=_current_counts(run_id),
+        last_extract_at=runs.now(),
+    )
+
+
+def _mark_search_cancelled(job, extra=None):
     """Finish a search job as cancelled without touching any output files."""
     job["status"] = "cancelled"
     job["error"] = None
-    job["result"] = {"cancelled": True}
+    result = {"cancelled": True}
+    if extra:
+        result.update(extra)
+    job["result"] = result
     job["log"].append("Search cancelled; previous results were kept.")
 
 
 def _run_search_job(job, query, sources, max_results, excluded_journals=None,
                     year_from=_YEARS_UNSET, year_to=_YEARS_UNSET,
                     local_folder=_LOCAL_UNSET, local_recursive=_LOCAL_UNSET,
-                    query_tree=None):
+                    query_tree=None, query_selection=None, merge=False):
+    run_enabled = _runs_enabled()
+    merge = bool(merge and run_enabled)
+    previous_paths = None
+    new_run_id = None
+    run_id = None
+    committed = False
+
+    def rollback_new_run():
+        """Undo a new run that never produced a complete dataset."""
+        nonlocal new_run_id, committed
+        if not new_run_id or committed:
+            return
+        try:
+            if previous_paths is not None:
+                runs.restore_paths(previous_paths)
+            else:
+                runs.apply_legacy_paths()
+        except Exception as exc:  # noqa: BLE001 - rollback must keep going
+            app.logger.warning("Could not restore previous run paths: %s", exc)
+            job["log"].append(
+                f"Warning: could not restore previous run paths: {exc}"
+            )
+        try:
+            runs.delete_run(new_run_id)
+            job["log"].append("Discarded the incomplete run folder.")
+        except Exception as exc:  # noqa: BLE001 - rollback must keep going
+            app.logger.warning("Could not delete incomplete run: %s", exc)
+            job["log"].append(f"Warning: could not delete incomplete run: {exc}")
+        new_run_id = None
+
+    def cancel():
+        rollback_new_run()
+        extra = None
+        if run_enabled:
+            # A cancelled new search has no run any more; a cancelled refresh
+            # still belongs to the active run.
+            reported = run_id if merge else None
+            extra = {"run_id": reported, "merged": merge, "added": 0}
+        _mark_search_cancelled(job, extra)
+
     try:
         settings = load_settings()
         apply_settings(settings)
@@ -314,13 +466,61 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None,
             "local_recursive": local_recursive,
         })
 
+        # ---- Run folder / refresh setup ----------------------------------
+        # Everything below reads config paths dynamically, so switching them
+        # here is enough to make the whole engine write into this run.
+        if run_enabled:
+            if merge:
+                run_id = runs.current_run_id()
+                if not run_id:
+                    raise RuntimeError("No run is loaded to refresh.")
+                runs.apply_run_paths(run_id)
+                job["log"].append(
+                    f"Refreshing run {run_id}; extraction outputs are kept."
+                )
+            else:
+                previous_paths = runs.capture_paths()
+                initial_state = {
+                    "name": _run_name(query, local_folder),
+                    "status": "searching",
+                    "query": _run_query_state(query, query_tree, query_selection),
+                    "sources": sources,
+                    "max_results": max_results,
+                    "year_from": year_from,
+                    "year_to": year_to,
+                    "excluded_journals": terms,
+                    "local_folder": local_folder,
+                    "local_recursive": local_recursive,
+                    "local_only": not online,
+                    "extraction": {
+                        "goal": "",
+                        "columns": [],
+                        "mode": getattr(config, "EXTRACTION_MODE", "records"),
+                    },
+                    "settings": _run_settings(settings),
+                    "counts": {
+                        "papers": 0, "extracted": 0, "closed": 0, "figures": 0,
+                    },
+                }
+                new_run_id = runs.create_run(
+                    name=initial_state["name"], state=initial_state
+                )
+                if not new_run_id:
+                    raise RuntimeError("Could not create a run folder.")
+                run_id = new_run_id
+                runs.apply_run_paths(run_id)
+                saved_state = runs.load_state(run_id) or {}
+                job["log"].append(
+                    f"New run: {saved_state.get('name') or run_id} ({run_id})"
+                )
+
         # Scan inside the job so a large folder reports progress instead of
         # blocking the request. Invalid folders are also rejected by /api/search.
         # Cancellation is cooperative: a scan that is already running finishes,
         # then the job stops before any online search or output write.
         local_papers, local_stats = [], None
         if _cancel_requested(job):
-            _mark_search_cancelled(job)
+            cancel()
             return
         if local_folder:
             local_papers, local_stats = local_pdfs.scan_folder(
@@ -337,7 +537,7 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None,
                 job["log"].append(f"   !! {detail['file']}: {detail['error']}")
 
         if _cancel_requested(job):
-            _mark_search_cancelled(job)
+            cancel()
             return
 
         if online:
@@ -348,7 +548,7 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None,
                     cancel_check=lambda: _cancel_requested(job),
                 )
             except searchers.SearchCancelled:
-                _mark_search_cancelled(job)
+                cancel()
                 return
         else:
             papers = []
@@ -358,42 +558,108 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None,
         # finished after a cancel click. Check once more before any existing
         # output is replaced.
         if _cancel_requested(job):
-            _mark_search_cancelled(job)
+            cancel()
             return
 
-        if local_papers:
-            before_local = len(papers)
-            papers = local_pdfs.merge_local_papers(papers, local_papers)
-            local_added = len(papers) - before_local
-            job["log"].append(
-                f"Merged local PDFs: {len(local_papers) - local_added} matched "
-                f"existing paper(s), {local_added} added as new paper(s)."
-            )
-
+        # On a refresh, merge with the sheet that already lives in this run so
+        # the operation is additive and never starts a new dataset. Local PDFs
+        # are merged first so a local copy matches a new online record.
+        if merge:
+            existing_papers = _load_search_results(required=False)
+            if local_papers:
+                before_local = len(papers)
+                papers = local_pdfs.merge_local_papers(papers, local_papers)
+                local_added = len(papers) - before_local
+                job["log"].append(
+                    f"Merged local PDFs: {len(local_papers) - local_added} matched "
+                    f"existing paper(s), {local_added} added as new paper(s)."
+                )
+            before_merge = len(existing_papers)
+            papers = searchers.merge_papers(existing_papers, papers)
+            added = max(0, len(papers) - before_merge)
+        else:
+            if local_papers:
+                before_local = len(papers)
+                papers = local_pdfs.merge_local_papers(papers, local_papers)
+                local_added = len(papers) - before_local
+                job["log"].append(
+                    f"Merged local PDFs: {len(local_papers) - local_added} matched "
+                    f"existing paper(s), {local_added} added as new paper(s)."
+                )
         papers, excluded = filters.filter_papers(papers, terms)
         rows = [_paper_to_row(p) for p in papers]
-        # A new search starts a fresh dataset: replace the search sheet AND clear
-        # any previous extraction outputs + resume state, so Extract only ever
-        # works on this search's papers. The index is replaced too, so old
-        # local mappings can never point at rows from the previous dataset.
-        writer.write_xlsx(config.SEARCH_RESULTS_XLSX, SEARCH_COLS, rows)
-        for path in (config.EXTRACTED_XLSX, config.CLOSED_SOURCE_XLSX):
-            if Path(path).exists():
-                Path(path).unlink()
-        Checkpoint(config.CHECKPOINT_JSON).reset()
-        local_pdfs.write_index(papers, replace=True)
-        # Figures belong to the previous dataset too: clear the index, xlsx and
-        # cached PNGs so stale thumbnails can never appear in the new gallery.
-        try:
-            cleared = figures.clear()
-            if (cleared or {}).get("warning"):
-                job["log"].append(f"Warning: {cleared['warning']}")
-        except Exception as exc:  # noqa: BLE001 - figure cleanup is best-effort
-            app.logger.warning("Could not clear figure gallery: %s", exc)
-            job["log"].append(f"Warning: could not clear old figures: {exc}")
+        if not merge:
+            added = len(rows)
+
+        if merge:
+            # Keep the existing extraction/closed/checkpoint/figure outputs.
+            writer.write_xlsx(config.SEARCH_RESULTS_XLSX, SEARCH_COLS, rows)
+            local_pdfs.write_index(papers, replace=False)
+            job["log"].append(
+                "Refreshed the search sheet; extraction outputs and "
+                "checkpoint were kept."
+            )
+        else:
+            # A new search starts a fresh dataset: replace the search sheet AND
+            # clear any previous extraction outputs + resume state, so Extract
+            # only ever works on this search's papers. The index is replaced too,
+            # so old local mappings can never point at rows from the previous
+            # dataset.
+            writer.write_xlsx(config.SEARCH_RESULTS_XLSX, SEARCH_COLS, rows)
+            for path in (config.EXTRACTED_XLSX, config.CLOSED_SOURCE_XLSX):
+                if Path(path).exists():
+                    Path(path).unlink()
+            Checkpoint(config.CHECKPOINT_JSON).reset()
+            local_pdfs.write_index(papers, replace=True)
+            # Figures belong to the previous dataset too: clear the index, xlsx
+            # and cached PNGs so stale thumbnails can never appear.
+            try:
+                cleared = figures.clear()
+                if (cleared or {}).get("warning"):
+                    job["log"].append(f"Warning: {cleared['warning']}")
+            except Exception as exc:  # noqa: BLE001 - cleanup is best-effort
+                app.logger.warning("Could not clear figure gallery: %s", exc)
+                job["log"].append(f"Warning: could not clear old figures: {exc}")
+
+        # From here on the dataset is complete: a later error must not delete
+        # the new run or restore the old paths.
+        committed = True
+
+        if run_enabled and run_id:
+            if merge:
+                counts = _current_counts(run_id)
+                counts["papers"] = len(rows)
+            else:
+                counts = {
+                    "papers": len(rows), "extracted": 0, "closed": 0, "figures": 0,
+                }
+            _save_run_state(
+                job,
+                run_id,
+                status="ready",
+                query=_run_query_state(query, query_tree, query_selection),
+                sources=sources,
+                max_results=max_results,
+                year_from=year_from,
+                year_to=year_to,
+                excluded_journals=terms,
+                local_folder=local_folder,
+                local_recursive=local_recursive,
+                local_only=not online,
+                counts=counts,
+                last_search_at=runs.now(),
+                settings=_run_settings(settings),
+            )
+            try:
+                runs.set_active(run_id)
+            except Exception as exc:  # noqa: BLE001 - marker is best-effort
+                message = f"Could not mark run as active: {exc}"
+                app.logger.warning(message)
+                job["log"].append(f"Warning: {message}")
+
         job["result"] = {
             "papers": rows,
-            "added": len(rows),
+            "added": added,
             "total": len(rows),
             "excluded": len(excluded),
             "year_from": year_from,
@@ -403,6 +669,8 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None,
             "local_recursive": local_recursive,
             "local_count": len(local_papers),
             "local_stats": local_stats,
+            "run_id": run_id if run_enabled else None,
+            "merged": bool(merge),
         }
         job["status"] = "done"
         job["log"].append(f"Excluded {len(excluded)} paper(s) by journal blocklist.")
@@ -410,14 +678,22 @@ def _run_search_job(job, query, sources, max_results, excluded_journals=None,
         local_note = (
             f"; {len(local_papers)} local PDF(s)" if local_folder else ""
         )
-        job["log"].append(
-            f"Done: {len(rows)} papers in the sheet "
-            f"({len(excluded)} excluded by journal{year_note}{local_note}; "
-            "previous data cleared)."
-        )
+        if merge:
+            job["log"].append(
+                f"Done: {len(rows)} papers in the sheet "
+                f"({added} new, {len(excluded)} excluded by journal"
+                f"{year_note}{local_note}; extraction data kept)."
+            )
+        else:
+            job["log"].append(
+                f"Done: {len(rows)} papers in the sheet "
+                f"({len(excluded)} excluded by journal{year_note}{local_note}; "
+                "previous data cleared)."
+            )
     except searchers.SearchCancelled:
-        _mark_search_cancelled(job)
+        cancel()
     except Exception as e:
+        rollback_new_run()
         job["status"] = "error"
         job["error"] = str(e)
         job["log"].append(f"Error: {e}")
@@ -438,6 +714,7 @@ def _read_header(path):
 
 
 def _run_extract_job(job, goal, columns, mode="records"):
+    run_id = None
     try:
         apply_settings(load_settings())
         mode = normalize_extraction_mode(mode)
@@ -460,6 +737,28 @@ def _run_extract_job(job, goal, columns, mode="records"):
         if columns:
             _record_history(job, "columns", {"text": ", ".join(columns)})
 
+        # Runs: extraction belongs to the loaded search dataset. Never create a
+        # run here — with no active run and no legacy data, extraction keeps its
+        # existing "no search results" behaviour on the global paths.
+        if _runs_enabled():
+            try:
+                run_id = runs.ensure_active_run()
+                if run_id:
+                    _save_run_state(
+                        job,
+                        run_id,
+                        status="extracting",
+                        extraction={
+                            "goal": goal,
+                            "columns": list(columns or []),
+                            "mode": mode,
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001 - extraction must continue
+                message = f"Could not activate the run folder: {exc}"
+                app.logger.warning(message)
+                job["log"].append(f"Warning: {message}")
+
         job["log"].append(f"Extraction mode: {mode}")
 
         papers = _load_search_results(required=False)
@@ -473,6 +772,7 @@ def _run_extract_job(job, goal, columns, mode="records"):
                 "cancelled": False,
             }
             job["log"].append("No search results yet — run a search first.")
+            _finish_extract_run(job, run_id, "done")
             return
 
         # Decide whether the existing sheet belongs to the same user fields.
@@ -668,16 +968,19 @@ def _run_extract_job(job, goal, columns, mode="records"):
                 f"Extraction cancelled after {processed} paper(s); "
                 "completed rows were kept."
             )
+            _finish_extract_run(job, run_id, "cancelled")
             return
 
         job["progress"]["done"] = len(todo)
         job["progress"]["current"] = ""
         job["status"] = "done"
         job["log"].append(f"Done: {n_extracted} row(s) extracted, {n_closed} paper(s) closed.")
+        _finish_extract_run(job, run_id, "done")
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
         job["log"].append(f"Error: {e}")
+        _finish_extract_run(job, run_id, "error")
 
 
 # --------------------------------------------------------------------------
@@ -833,6 +1136,109 @@ def api_history_clear():
     return jsonify({"cleared": history.clear(kind)})
 
 
+def _ensure_active_run_for_read():
+    """Prepare the active run without switching paths under a running job.
+
+    A search job has already switched to its (possibly brand-new) run paths.
+    A page reload must not call ``ensure_active_run()`` and repoint them back at
+    the previous marker while the job is still writing. The next list refresh
+    after the job finishes repairs the marker normally.
+    """
+    with JOB_LOCK:
+        if _active_job():
+            return None
+    try:
+        return runs.ensure_active_run()
+    except Exception as exc:  # noqa: BLE001 - reading must still work
+        app.logger.warning("Could not prepare the active run: %s", exc)
+        return None
+
+
+@app.route("/api/runs")
+def api_runs():
+    """List saved runs and the currently loaded one.
+
+    The response only contains state metadata (never filesystem paths). When
+    runs are enabled, ``ensure_active_run()`` is called first so a missing or
+    corrupt marker is repaired best-effort.
+    """
+    if not _runs_enabled():
+        return jsonify({"enabled": False, "active": None, "runs": []})
+    _ensure_active_run_for_read()
+    active_id = runs.current_run_id()
+    items = runs.list_runs()
+    active = next((item for item in items if item["id"] == active_id), None)
+    return jsonify({"enabled": True, "active": active, "runs": items})
+
+
+@app.route("/api/run")
+def api_run():
+    """Return the active run's metadata and its full (non-secret) state."""
+    if not _runs_enabled():
+        return jsonify({"enabled": False, "run": None, "state": None})
+    _ensure_active_run_for_read()
+    active_id = runs.current_run_id()
+    if not active_id:
+        return jsonify({"enabled": True, "run": None, "state": None})
+    state = runs.load_state(active_id)
+    if state is None:
+        return jsonify({"enabled": True, "run": None, "state": None})
+    active = next(
+        (item for item in runs.list_runs() if item["id"] == active_id), None
+    )
+    return jsonify({"enabled": True, "run": active, "state": state})
+
+
+def _job_running_response():
+    return jsonify({
+        "error": "A task is already running. Cancel it or wait for it to "
+                 "finish, then try again."
+    }), 409
+
+
+@app.route("/api/runs/<run_id>/load", methods=["POST"])
+def api_run_load(run_id):
+    """Load a saved run. This restores state/paths but never starts a job."""
+    if not _runs_enabled():
+        return jsonify({"error": "Run folders are disabled."}), 404
+    with JOB_LOCK:
+        if _active_job():
+            return _job_running_response()
+        try:
+            state = runs.activate_run(run_id)
+        except ValueError:
+            return jsonify({"error": "Run does not exist."}), 404
+        if state is None:
+            return jsonify({"error": "Run does not exist."}), 404
+        active = next(
+            (item for item in runs.list_runs() if item["id"] == state["id"]),
+            None,
+        )
+    return jsonify({"run": active, "state": state})
+
+
+@app.route("/api/runs/<run_id>/delete", methods=["POST"])
+def api_run_delete(run_id):
+    """Delete a non-active run folder. The active run must be switched first."""
+    if not _runs_enabled():
+        return jsonify({"error": "Run folders are disabled."}), 404
+    with JOB_LOCK:
+        if _active_job():
+            return _job_running_response()
+        active_id = runs.current_run_id()
+        if active_id and str(run_id) == active_id:
+            return jsonify({
+                "error": "Cannot delete the active run. Load another run first."
+            }), 409
+        try:
+            deleted = runs.delete_run(run_id)
+        except ValueError:
+            return jsonify({"error": "Run does not exist."}), 404
+    if not deleted:
+        return jsonify({"error": "Run does not exist."}), 404
+    return jsonify({"deleted": run_id})
+
+
 @app.route("/api/search", methods=["POST"])
 def api_search():
     data = request.get_json(force=True, silent=True) or {}
@@ -841,6 +1247,8 @@ def api_search():
     if isinstance(sources, str):
         sources = [sources]
     sources = [str(s).strip() for s in sources if str(s).strip()]
+    merge = _as_bool(data.get("merge"))
+    query_selection = data.get("query_selection")
     settings = load_settings()
     max_results = data.get("max_results") or settings.get("max_results") or config.DEFAULT_MAX_RESULTS
 
@@ -916,11 +1324,23 @@ def api_search():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    job, err = _start_job(
-        "search", _run_search_job, query, sources, max_results,
-        excluded_journals, year_from, year_to, local_folder, local_recursive,
-        data.get("query_tree"),
+    if merge:
+        if not _runs_enabled():
+            return jsonify({
+                "error": "Refresh search requires run folders, which are disabled."
+            }), 400
+        if not runs.current_run_id():
+            return jsonify({"error": "No run is loaded to refresh."}), 400
+
+    # Keep the legacy positional shape when runs are disabled: older clients
+    # (and the existing API tests) do not know about the two run arguments.
+    search_args = (
+        query, sources, max_results, excluded_journals, year_from, year_to,
+        local_folder, local_recursive, data.get("query_tree"),
     )
+    if _runs_enabled():
+        search_args += (query_selection, merge)
+    job, err = _start_job("search", _run_search_job, *search_args)
     if err:
         return jsonify({"error": err}), 409
     # A search is an implicit save for the blocklist, an explicitly supplied
@@ -1203,16 +1623,23 @@ def _open_folder(path):
 
 @app.route("/open-output", methods=["POST"])
 def open_output():
-    # The files already live in output/ — this just opens that folder in the
-    # OS file manager so users don't have to hunt for it.
+    # The files live in output/ or in the active run folder — this just opens
+    # that folder in the OS file manager so users don't have to hunt for it.
     try:
-        _open_folder(config.OUTPUT_DIR)
+        _open_folder(config.ACTIVE_RUN_DIR or config.OUTPUT_DIR)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
+    # `python app.py` / start.sh use per-run folders. Importing app (tests, CLI
+    # helpers) keeps RUNS_ENABLED=False and the legacy global output paths.
+    config.RUNS_ENABLED = True
+    try:
+        runs.ensure_active_run()
+    except Exception as exc:  # noqa: BLE001 - app must still start
+        print(f"Warning: could not prepare run folders: {exc}")
     if config.APP_AUTO_OPEN:
         url = f"http://{config.APP_HOST}:{config.APP_PORT}"
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
