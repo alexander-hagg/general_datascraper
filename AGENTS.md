@@ -128,12 +128,21 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
 - `pdf_annotations.py`: locates the model's verbatim `evidence` quote in the
   archived PDF (PyMuPDF `search_for`, normalized block matching, then
   `difflib.SequenceMatcher` fuzzy matching at `EVIDENCE_FUZZY_THRESHOLD`),
-  fills `evidence_page`, writes one cached highlighted PDF per paper to
+  fills `evidence_page`, writes one cached annotated PDF per paper to
   `output/annotated_pdfs/`, and updates `output/pdf_index.json` atomically under
-  a lock. The annotation filename contains a hash of paper key + source bytes +
-  evidence list; a matching file is reused. The index stores basenames only.
-  `annotate_paper_rows()` fills rows and returns `(rows, summary)` and never
-  raises. `load_index()`, `api_summary()`, `resolve_paper_paths()` and
+  a lock. Every resolved quote gets the same explicit yellow highlight
+  (`HIGHLIGHT_COLOR = (1.0, 1.0, 0.0)`), exact and fuzzy alike. Each highlight's
+  comment popup contains `Data: field=value; field=value` built from the
+  extracted row (`ANNOTATION_META_COLUMNS` — `paper_key`, `row_index`, `doi`,
+  `source`, `publication_type`, `pdf_file`, `pdf_source`, `evidence`,
+  `evidence_page` — are excluded, values are stringified and capped) followed
+  by `Evidence: "…"`; rows with no user data fall back to `Row N` + the quote.
+  Index evidence items store `{row_index, text, page, status, data}`. The
+  annotation filename contains a hash of paper key + source bytes + evidence
+  list + per-row data mapping, so changing the quote or any extracted value
+  regenerates the file; a matching file is reused. The index stores basenames
+  only. `annotate_paper_rows()` fills rows and returns `(rows, summary)` and
+  never raises. `load_index()`, `api_summary()`, `resolve_paper_paths()` and
   `regenerate_annotation()` are the safe read/serve helpers (they reject
   absolute paths, `..` and escapes outside `PDF_DIR` / `ANNOTATED_PDF_DIR`).
 - `figures.py`: PDF-only, goal-driven figure/table search during Extract.
@@ -306,9 +315,13 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   true. Any exception is logged as a warning; the extracted rows (with evidence
   text and blank `evidence_page`) are still written. No PDF means the quote is
   kept and the page stays blank. The index registers a PDF even when no quote
-  resolves, so the viewer can show the original. The index/annotations store
-  basenames only; never add an API/serving path that accepts a caller-supplied
-  filename. There is **no OCR**: image-only PDFs leave quotes unresolved.
+  resolves, so the viewer can show the original. Highlights are always yellow
+  and each popup must keep both the row's non-meta extracted data
+  (`Data: field=value; …`) and the verbatim quote; the annotation hash includes
+  that data, so editing an extracted value must invalidate the cached PDF. The
+  index/annotations store basenames only; never add an API/serving path that
+  accepts a caller-supplied filename. There is **no OCR**: image-only PDFs leave
+  quotes unresolved.
 - **Figure search is goal-driven, best-effort and PDF-only:** both
   `main.run_extract()` and `app._run_extract_job()` call
   `figures.process_paper()` whenever `FIGURES_ENABLED` and `pdf.get("path")`

@@ -50,6 +50,28 @@ FUZZY = "fuzzy"
 UNRESOLVED = "unresolved"
 STATUSES = (EXACT, FUZZY, UNRESOLVED)
 
+# Every located quote is highlighted in the same explicit yellow, independent
+# of whether it was an exact or fuzzy match.
+HIGHLIGHT_COLOR = (1.0, 1.0, 0.0)
+
+# Pipeline/meta columns are never copied into the annotation popup: they are
+# identifiers or rendering metadata, not the extracted data the user asked for.
+ANNOTATION_META_COLUMNS = frozenset({
+    "paper_key",
+    "row_index",
+    "doi",
+    "source",
+    "publication_type",
+    "pdf_file",
+    "pdf_source",
+    "evidence",
+    "evidence_page",
+})
+
+# Keep popups readable instead of dumping an entire (possibly huge) row.
+ANNOTATION_DATA_MAX_CHARS = 800
+ANNOTATION_VALUE_MAX_CHARS = 300
+
 _HYPHEN_BREAK_RE = re.compile(
     r"(?<=[^\W\d_])[-\u2010\u2011\u2012\u2013\u2014]\s*\n\s*(?=[^\W\d_])"
 )
@@ -404,6 +426,112 @@ def _clean_row_index(value):
     return text
 
 
+def _clean_field_name(value):
+    """Return a compact, non-empty field name for a popup data pair."""
+    try:
+        text = " ".join(str(value if value is not None else "").split())
+    except Exception:
+        return ""
+    return text[:120]
+
+
+def _stringify_data_value(value):
+    """Turn any extracted value into a readable, bounded string.
+
+    Lists/tuples/sets are joined with commas and dicts with ``key=value;``
+    pairs, so unusual LLM output never crashes annotation creation. ``None``,
+    booleans, numbers and arbitrary objects fall back to ``str()``.
+    """
+    try:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            text = value.strip()
+        elif isinstance(value, bool):
+            text = "true" if value else "false"
+        elif isinstance(value, (int, float)):
+            text = str(value)
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            parts = []
+            for item in value:
+                part = _stringify_data_value(item)
+                if part:
+                    parts.append(part)
+            text = ", ".join(parts)
+        elif isinstance(value, dict):
+            parts = []
+            for key, item in value.items():
+                name = _clean_field_name(key)
+                part = _stringify_data_value(item)
+                if name and part:
+                    parts.append(f"{name}={part}")
+            text = "; ".join(parts)
+        else:
+            text = str(value).strip()
+    except Exception:
+        return ""
+    if not text:
+        return ""
+    text = " ".join(text.split())
+    if len(text) > ANNOTATION_VALUE_MAX_CHARS:
+        text = text[: ANNOTATION_VALUE_MAX_CHARS - 1].rstrip() + "…"
+    return text
+
+
+def _row_data(row):
+    """Collect the non-empty extracted fields of one row for the popup.
+
+    Pipeline/meta columns (``ANNOTATION_META_COLUMNS``) are skipped. Key order
+    is preserved so the popup follows the user's extraction-field order.
+    """
+    if not isinstance(row, dict):
+        return {}
+    data = {}
+    for key, value in row.items():
+        name = _clean_field_name(key)
+        if not name or name in ANNOTATION_META_COLUMNS:
+            continue
+        text = _stringify_data_value(value)
+        if text:
+            data[name] = text
+    return data
+
+
+def _clean_data(value):
+    """Sanitize a stored data mapping (drop meta names/empty values)."""
+    if not isinstance(value, dict):
+        return {}
+    clean = {}
+    for key, item in value.items():
+        name = _clean_field_name(key)
+        if not name or name in ANNOTATION_META_COLUMNS:
+            continue
+        text = _stringify_data_value(item)
+        if text:
+            clean[name] = text
+    return clean
+
+
+def _format_data(value):
+    """Render a data mapping as ``field=value; field=value`` (bounded)."""
+    data = _clean_data(value)
+    text = "; ".join(f"{key}={item}" for key, item in data.items())
+    if len(text) > ANNOTATION_DATA_MAX_CHARS:
+        text = text[: ANNOTATION_DATA_MAX_CHARS - 1].rstrip() + "…"
+    return text
+
+
+def _annotation_content(item):
+    """Build one highlight popup containing the data point and the quote."""
+    quote = str(item.get("text") or "").strip()
+    data_text = _format_data(item.get("data"))
+    if data_text:
+        return f'Data: {data_text}\nEvidence: "{quote}"'
+    row_index = str(item.get("row_index") or "").strip()
+    label = f"Row {row_index}" if row_index else "ScrapeLite evidence"
+    return f'{label}\nEvidence: "{quote}"'
+
+
 def _clean_evidence(value):
     if not isinstance(value, list):
         return []
@@ -429,6 +557,7 @@ def _clean_evidence(value):
             "text": text,
             "page": page,
             "status": status,
+            "data": _clean_data(item.get("data")),
         })
     return cleaned
 
@@ -487,7 +616,9 @@ def _write_index_unlocked(index, path=None):
     )
     try:
         temp.write_text(
-            json.dumps(index, indent=2, ensure_ascii=False, sort_keys=True),
+            # Keep insertion order so an annotation's data pairs keep the
+            # extraction-field order when the index is reloaded/regenerated.
+            json.dumps(index, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
         os.replace(temp, index_path)
@@ -546,6 +677,8 @@ def api_summary(index=None):
                 }
                 for item in entry["evidence"]
             ],
+            # The row data mapping stays internal: the viewer already gets the
+            # extracted rows, and the API only exposes this fixed shape.
         }
     return summary
 
@@ -589,6 +722,7 @@ def _annotation_hash(paper_key, source_hash, evidence):
                 "text": item.get("text"),
                 "page": item.get("page"),
                 "status": item.get("status"),
+                "data": _clean_data(item.get("data")),
             }
             for item in (evidence or [])
         ],
@@ -602,21 +736,20 @@ def _annotation_filename(paper_key, annotation_hash):
 
 
 def _write_annotated(document, resolved, target):
-    """Add highlights/comments to `document` and atomically save to `target`."""
+    """Add yellow highlights/comments to `document` and save to `target`."""
     for item, rects in resolved:
         try:
             page = document[int(item["page"]) - 1]
         except (IndexError, TypeError, ValueError):
             continue
-        color = (1.0, 0.85, 0.15) if item["status"] == EXACT else (1.0, 0.6, 0.2)
+        content = _annotation_content(item)
         for rect in rects:
             try:
                 annot = page.add_highlight_annot(rect)
-                annot.set_colors(stroke=color)
-                annot.set_info(
-                    title="ScrapeLite evidence",
-                    content=f"Row {item['row_index']}: {item['text']}",
-                )
+                # Yellow for exact and fuzzy matches alike (the popup carries
+                # the match status separately in the index, if needed).
+                annot.set_colors(stroke=HIGHLIGHT_COLOR)
+                annot.set_info(title="ScrapeLite evidence", content=content)
                 annot.update()
             except Exception:
                 # One malformed rectangle must not lose the rest of the PDF.
@@ -732,6 +865,7 @@ def annotate_paper_rows(rows, pdf_path=None, paper_key="", title="",
                 "text": quote,
                 "page": page if status != UNRESOLVED else None,
                 "status": status,
+                "data": _row_data(row),
             }
             evidence.append(item)
             if status != UNRESOLVED:
