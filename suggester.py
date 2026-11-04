@@ -1,7 +1,7 @@
 """
-suggester.py — search-term suggestions for the query builder.
+suggester.py — search-term and extraction-goal suggestions for the web app.
 
-Two independent helpers, both called from app.py:
+Three independent helpers, all called from app.py:
 
   - autocomplete(query): instant completions from PubMed's public suggestion
     endpoint (https://pubmed.ncbi.nlm.nih.gov/suggestions/). Errors are treated
@@ -13,8 +13,12 @@ Two independent helpers, both called from app.py:
     the configured model cannot be reached, so the UI can show an actionable
     message.
 
-Neither helper touches the search or extraction pipeline and neither has any
-state-changing side effects.
+  - suggest_goal(goal, columns, mode): rewrites the user's extraction goal as
+    one to three clearer, more extraction-friendly goals. It only returns text
+    candidates; applying one is an explicit user action in the UI.
+
+None of the helpers touch the search or extraction pipeline and none has any
+state-changing side effects (in particular, they never record prompt history).
 """
 
 import json
@@ -30,6 +34,16 @@ AUTOCOMPLETE_TIMEOUT = 6      # seconds — keep the dropdown snappy
 LLM_TIMEOUT = 120             # seconds — interactive, much shorter than extraction
 MAX_AUTOCOMPLETE = 8
 MAX_RELATED = 8
+MAX_GOALS = 3
+MAX_GOAL_CHARS = 4000
+MAX_GOAL_SUGGESTION_CHARS = 1200
+MAX_GOAL_COLUMNS = 50
+MAX_GOAL_COLUMN_CHARS = 80
+GOAL_MODES = ("records", "table")
+GOAL_MODE_LABELS = {
+    "records": "individual records (one row per distinct record)",
+    "table": "table rows (one row per table row, never merged)",
+}
 
 
 def llm_source():
@@ -75,6 +89,14 @@ _MULTI_SCHEMA = {
         },
     },
     "required": ["groups"],
+}
+
+_GOAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "suggestions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["suggestions"],
 }
 
 
@@ -317,3 +339,142 @@ def suggest_related_many(terms):
         {"term": t, "suggestions": by_term.get(t.lower(), [])}
         for t in clean_terms
     ]
+
+
+# --------------------------------------------------------------------------
+# LLM "Improve goal" (extraction instruction)
+# --------------------------------------------------------------------------
+
+_GOAL_RULES = (
+    "Rewrite the extraction goal as a precise instruction for a research-paper "
+    "extraction assistant. Preserve the user's scientific intent; do not change "
+    "what they want to learn. Make the goal self-contained, specific and "
+    "extraction-friendly. Clarify what counts as one record (or one table row), "
+    "which conditions, units and quantified values matter, and whether negative "
+    "or null findings should be reported. State the output granularity explicitly. "
+    "Do not invent domain facts, values, or requirements the user did not ask for. "
+    "Return 1-3 concise candidate goals, not commentary."
+)
+
+
+def _clean_goal(goal):
+    """Validate and normalise the user's extraction goal."""
+    if goal is None:
+        goal = ""
+    if not isinstance(goal, str):
+        raise ValueError("The extraction goal must be text.")
+    goal = re.sub(r"\s+", " ", goal).strip()
+    if not goal:
+        raise ValueError("Describe what data you want to extract first.")
+    if len(goal) > MAX_GOAL_CHARS:
+        raise ValueError(
+            f"The extraction goal is too long (max {MAX_GOAL_CHARS} characters)."
+        )
+    return goal
+
+
+def _clean_goal_columns(columns):
+    """Return cleaned, deduped column names from a list or comma-separated string."""
+    if columns is None:
+        return []
+    if isinstance(columns, str):
+        raw_columns = columns.split(",")
+    elif isinstance(columns, (list, tuple)):
+        raw_columns = columns
+    else:
+        raise ValueError(
+            "Columns must be a list of names or a comma-separated string."
+        )
+
+    out, seen = [], set()
+    for raw in raw_columns:
+        if raw is None:
+            continue
+        name = re.sub(r"\s+", " ", str(raw)).strip()
+        if not name:
+            continue
+        if len(name) > MAX_GOAL_COLUMN_CHARS:
+            name = name[:MAX_GOAL_COLUMN_CHARS].rstrip()
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+        if len(out) >= MAX_GOAL_COLUMNS:
+            break
+    return out
+
+
+def _goal_mode(mode):
+    """Validate and normalise the extraction mode for the goal prompt."""
+    value = str(mode or "records").strip().lower()
+    if value not in GOAL_MODES:
+        raise ValueError(
+            f"Unknown extraction mode '{mode}'. Choose one of: "
+            f"{', '.join(GOAL_MODES)}."
+        )
+    return value
+
+
+def _goal_prompt(goal, columns, mode):
+    listed = ", ".join(columns) if columns else "(none specified)"
+    return (
+        "You are an expert extraction-instruction editor.\n"
+        f'Current goal: "{goal}"\n'
+        f"Requested columns: {listed}\n"
+        f"Extraction mode: {GOAL_MODE_LABELS[mode]}\n\n"
+        + _GOAL_RULES
+        + "\nReturn a JSON object with one key, \"suggestions\", whose value is an "
+        "array of 1-3 goal strings. Return ONLY the JSON object (no prose, no "
+        "markdown)."
+    )
+
+
+def _clean_goal_suggestions(values):
+    """Normalise, dedupe and cap the model's rewritten goals."""
+    out, seen = [], set()
+    if not isinstance(values, list):
+        return out
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        s = value.strip()
+        # Tolerate models that wrap an item in a fence or decorate it with
+        # markdown despite being asked for plain strings.
+        s = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+        s = re.sub(r"^#{1,6}\s+", "", s)
+        s = re.sub(r"^(?:[-*\u2022]|\d+[.)])\s+", "", s)
+        s = re.sub(r"(\*\*|__)(.+?)\1", r"\2", s)
+        s = re.sub(r"^(?:goal|option)\s*\d*\s*[:\-]\s*", "", s, flags=re.IGNORECASE)
+        s = s.strip().strip('"').strip("'").strip()
+        s = re.sub(r"\s+", " ", s)
+        if len(s) > MAX_GOAL_SUGGESTION_CHARS:
+            s = s[:MAX_GOAL_SUGGESTION_CHARS].rstrip()
+        key = s.lower()
+        if not s or key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+        if len(out) >= MAX_GOALS:
+            break
+    return out
+
+
+def suggest_goal(goal, columns=None, mode="records"):
+    """Return 1-3 clearer extraction goals for the current goal/columns/mode.
+
+    Raises ValueError for invalid input and BackendUnavailable when the
+    configured LLM cannot be reached. This function has no side effects: it
+    does not save the goal, start an extraction job, or record prompt history.
+    """
+    clean_goal = _clean_goal(goal)
+    clean_columns = _clean_goal_columns(columns)
+    clean_mode = _goal_mode(mode)
+    _require_backend()
+    raw = _call_llm(
+        _goal_prompt(clean_goal, clean_columns, clean_mode),
+        _GOAL_SCHEMA,
+    )
+    data = _load_json_object(raw or "") or {}
+    return _clean_goal_suggestions(data.get("suggestions"))
