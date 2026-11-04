@@ -120,7 +120,8 @@ Click any data row to select it. The panel on the right shows the paper
 metadata, the **verbatim evidence quote** for that row, its 1-based page and
 whether the quote was found exactly, only fuzzily, or not at all. When a PDF is
 available, an **annotated PDF viewer** opens at that page with the quote
-highlighted; **Open in new tab ↗** opens the same PDF in its own browser tab.
+highlighted in **yellow**; the highlight's popup also shows the extracted data
+for that row. **Open in new tab ↗** opens the same PDF in its own browser tab.
 If no PDF was archived, the viewer is hidden and the quote panel remains as the
 fallback. The technical `paper_key` column is used behind the scenes and is not
 shown in the data tables; your own extracted columns are always shown.
@@ -606,13 +607,20 @@ During **Extract**, after the model answers, ScrapeLite:
 2. writes the 1-based page number to `evidence_page`. Unlocated quotes keep a
    blank page (they are never guessed);
 3. writes one cached, highlighted copy per paper to
-   `output/annotated_pdfs/`. Annotation comments name the row and contain the
-   quote. Exact and fuzzy matches use different highlight colours;
+   `output/annotated_pdfs/`. Every resolved quote — exact or fuzzy — gets an
+   explicit **yellow** highlight. The highlight's comment/popup contains both
+   the extracted data for that row, e.g.
+   `Data: mutation=A123T; effect=loss of function`, and the verbatim quote
+   (`Evidence: "the quote from the paper"`). Pipeline/meta columns (`paper_key`,
+   `row_index`, `doi`, `source`, `publication_type`, `pdf_file`, `pdf_source`,
+   `evidence`, `evidence_page`) are never included in that data line; rows with
+   no user data fall back to a row label plus the quote;
 4. updates `output/pdf_index.json` with the source PDF, annotation file,
-   evidence page/status list and timestamp. Only basenames are stored, never
-   absolute paths. The annotation filename contains a hash of the paper key,
-   source PDF bytes and evidence list, so changing any of those regenerates the
-   file; an identical request reuses the existing cached copy.
+   evidence page/status list, the row's data mapping and timestamp. Only
+   basenames are stored, never absolute paths. The annotation filename contains
+   a hash of the paper key, source PDF bytes, evidence list and row data, so
+   changing either the quote or any extracted value regenerates the file; an
+   identical request reuses the existing cached copy.
 
 The index also registers a paper when **no** quote could be located, so the
 viewer can still show the original PDF. If annotation itself fails for any

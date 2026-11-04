@@ -47,6 +47,24 @@ def annotation_contents(path):
         doc.close()
 
 
+def annotation_details(path):
+    """Return type/colour/content for every annotation in a PDF."""
+    doc = pymupdf.open(str(path))
+    try:
+        return [
+            {
+                "type": annot.type,
+                "colors": dict(annot.colors),
+                "content": annot.info.get("content", ""),
+                "title": annot.info.get("title", ""),
+            }
+            for page in doc
+            for annot in page.annots()
+        ]
+    finally:
+        doc.close()
+
+
 class PdfAnnotationTestBase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -78,6 +96,9 @@ class PdfAnnotationTestBase(unittest.TestCase):
 
     def annotate(self, quotes, key="pmid:1", source=None):
         rows = [{"row_index": i, "evidence": q} for i, q in enumerate(quotes, 1)]
+        return self.annotate_rows(rows, key=key, source=source)
+
+    def annotate_rows(self, rows, key="pmid:1", source=None):
         return pdf_annotations.annotate_paper_rows(
             rows,
             source or self.source,
@@ -176,6 +197,145 @@ class AnnotationCreationTests(PdfAnnotationTestBase):
         )
         self.assertEqual(
             [item["page"] for item in entry["evidence"]], [2, 2, None]
+        )
+
+    def test_highlights_are_yellow_and_include_row_data(self):
+        rows = [
+            {
+                "row_index": 1,
+                "paper_key": "META_PAPER_KEY_SENTINEL",
+                "doi": "META_DOI_SENTINEL",
+                "source": "META_SOURCE_SENTINEL",
+                "publication_type": "META_TYPE_SENTINEL",
+                "pdf_file": "META_PDF_SENTINEL",
+                "pdf_source": "META_PDF_SOURCE_SENTINEL",
+                "evidence": "mutation increased current",
+                "evidence_page": "99",
+                "mutation": "A123T",
+                "effect": "loss of function",
+            },
+            {
+                "row_index": 2,
+                "mutation": "V456L",
+                "evidence": "mutation increased curent in oocytes",
+            },
+        ]
+        _rows, summary = self.annotate_rows(rows)
+        self.assertTrue(summary["annotation_file"])
+        annotated = self.annotated_dir / summary["annotation_file"]
+
+        details = annotation_details(annotated)
+        self.assertGreaterEqual(len(details), 2)
+        for annot in details:
+            self.assertEqual(annot["type"][1], "Highlight")
+            self.assertEqual(tuple(annot["colors"]["stroke"]), (1.0, 1.0, 0.0))
+            self.assertEqual(annot["title"], "ScrapeLite evidence")
+
+        contents = "\n".join(item["content"] for item in details)
+        self.assertIn(
+            'Data: mutation=A123T; effect=loss of function\n'
+            'Evidence: "mutation increased current"',
+            contents,
+        )
+        self.assertIn(
+            'Data: mutation=V456L\n'
+            'Evidence: "mutation increased curent in oocytes"',
+            contents,
+        )
+        for sentinel in (
+            "META_PAPER_KEY_SENTINEL",
+            "META_DOI_SENTINEL",
+            "META_SOURCE_SENTINEL",
+            "META_TYPE_SENTINEL",
+            "META_PDF_SENTINEL",
+            "META_PDF_SOURCE_SENTINEL",
+        ):
+            self.assertNotIn(sentinel, contents)
+
+    def test_rows_without_data_fall_back_to_a_row_label(self):
+        _rows, summary = self.annotate(["mutation increased current"])
+        annotated = self.annotated_dir / summary["annotation_file"]
+        contents = "\n".join(annotation_contents(annotated))
+        self.assertIn('Row 1\nEvidence: "mutation increased current"', contents)
+        self.assertNotIn("Data:", contents)
+
+    def test_changed_row_data_changes_hash_and_popup(self):
+        quote = "mutation increased current"
+        _rows, first = self.annotate_rows([
+            {"row_index": 1, "mutation": "A123T", "evidence": quote},
+        ])
+        _rows, second = self.annotate_rows([
+            {"row_index": 1, "mutation": "V456L", "evidence": quote},
+        ])
+        self.assertNotEqual(first["annotation_file"], second["annotation_file"])
+
+        first_contents = "\n".join(
+            annotation_contents(self.annotated_dir / first["annotation_file"])
+        )
+        second_contents = "\n".join(
+            annotation_contents(self.annotated_dir / second["annotation_file"])
+        )
+        self.assertIn("mutation=A123T", first_contents)
+        self.assertNotIn("mutation=V456L", first_contents)
+        self.assertIn("mutation=V456L", second_contents)
+        self.assertNotIn("mutation=A123T", second_contents)
+
+    def test_regeneration_keeps_the_row_data(self):
+        _rows, summary = self.annotate_rows([
+            {
+                "row_index": 1,
+                "mutation": "A123T",
+                "effect": "loss of function",
+                "evidence": "mutation increased current",
+            },
+        ])
+        entry = pdf_annotations.load_index()["pmid:1"]
+        self.assertEqual(
+            entry["evidence"][0]["data"],
+            {"mutation": "A123T", "effect": "loss of function"},
+        )
+
+        path = self.annotated_dir / summary["annotation_file"]
+        path.unlink()
+        regenerated = pdf_annotations.regenerate_annotation("pmid:1")
+        self.assertIsNotNone(regenerated)
+        contents = "\n".join(annotation_contents(regenerated))
+        self.assertIn("Data: mutation=A123T; effect=loss of function", contents)
+        self.assertIn('Evidence: "mutation increased current"', contents)
+        statuses = [
+            item["status"]
+            for item in pdf_annotations.load_index()["pmid:1"]["evidence"]
+        ]
+        self.assertEqual(statuses, ["exact"])
+
+    def test_non_string_values_are_rendered_and_bounded(self):
+        _rows, summary = self.annotate_rows([
+            {
+                "row_index": 1,
+                "evidence": "mutation increased current",
+                "count": 3,
+                "tags": ["alpha", "beta"],
+                "details": {"note": "kept", "blank": ""},
+                "missing": None,
+                "empty": "",
+                "long": "x" * 1000,
+            },
+        ])
+        contents = "\n".join(
+            annotation_contents(self.annotated_dir / summary["annotation_file"])
+        )
+        self.assertIn("count=3", contents)
+        self.assertIn("tags=alpha, beta", contents)
+        self.assertIn("details=note=kept", contents)
+        self.assertNotIn("missing=", contents)
+        self.assertNotIn("empty=", contents)
+        self.assertLessEqual(
+            len(pdf_annotations._stringify_data_value("x" * 1000)),
+            pdf_annotations.ANNOTATION_VALUE_MAX_CHARS,
+        )
+        self.assertLessEqual(
+            len(pdf_annotations._format_data({"long": "x" * 1000})),
+            pdf_annotations.ANNOTATION_DATA_MAX_CHARS,
         )
 
     def test_cache_reuse_and_regeneration(self):
@@ -279,6 +439,29 @@ class IndexSafetyTests(PdfAnnotationTestBase):
                 "pmid:1",
                 index={"pmid:1": self._entry(annotation_file="../../x.pdf")},
             )
+        )
+
+    def test_evidence_data_is_sanitized(self):
+        entry = self._entry(evidence=[{
+            "row_index": 1,
+            "text": "mutation increased current",
+            "page": 2,
+            "status": "exact",
+            "data": {
+                "mutation": "A123T",
+                "paper_key": "SENTINEL",
+                "doi": "SENTINEL",
+                "empty": "",
+            },
+        }])
+        pdf_annotations.save_index({"pmid:1": entry})
+        evidence = pdf_annotations.load_index()["pmid:1"]["evidence"][0]
+        self.assertEqual(evidence["data"], {"mutation": "A123T"})
+
+        summary = pdf_annotations.api_summary()["pmid:1"]
+        self.assertEqual(
+            set(summary["evidence"][0]),
+            {"row_index", "text", "page", "status"},
         )
 
     def test_unknown_key_returns_none(self):
