@@ -146,16 +146,24 @@ EVIDENCE_MAX_CHARS = 300
 EVIDENCE_FUZZY_THRESHOLD = 0.75
 
 # Figure/table screenshots (Extract step, PDF only). ScrapeLite scans each
-# archived PDF with PyMuPDF, crops caption regions (or large embedded images
-# on pages without captions), and saves PNGs under output/figures/.
+# archived PDF with PyMuPDF for caption regions (or large embedded images on
+# pages without captions), then asks the configured LLM which candidates help
+# answer the extraction goal. Only selected candidates are rendered and saved
+# as PNGs under output/figures/. If the goal does not ask for figures, images,
+# tables or visual data, no screenshots are saved.
+#   FIGURES_GOAL_FILTER  True = goal-driven selection (default);
+#                        False = legacy "save every detected figure" behaviour
 #   FIGURE_DPI           rendering resolution of each screenshot
-#   FIGURE_MAX_PER_PAPER safety cap per paper (the summary reports "capped")
+#   FIGURE_MAX_PER_PAPER safety cap on saved figures per paper
+#   FIGURE_MAX_CANDIDATES cap on candidates sent to the selection LLM
 # There is no OCR and no HTML/PMC figure download: image-only PDFs without a
-# text caption yield no figure. Detection is best-effort and never fails
-# extraction. The generated index and output/figures.xlsx are git-ignored.
+# text caption yield no figure. Detection/selection is best-effort and never
+# fails extraction. The generated index and output/figures.xlsx are git-ignored.
 FIGURES_ENABLED = True
+FIGURES_GOAL_FILTER = True
 FIGURE_DPI = 150
 FIGURE_MAX_PER_PAPER = 50
+FIGURE_MAX_CANDIDATES = 100
 FIGURES_DIR = OUTPUT_DIR / "figures"
 FIGURES_INDEX_JSON = FIGURES_DIR / "index.json"
 FIGURES_XLSX = OUTPUT_DIR / "figures.xlsx"

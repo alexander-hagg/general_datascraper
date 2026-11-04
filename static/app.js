@@ -2528,6 +2528,12 @@ function openFigureModal(fig, paperTitle) {
   ].filter(Boolean).join(" · ");
   document.getElementById("figure-modal-caption").textContent =
     cleanValue(fig.caption) || "No caption text was found for this figure.";
+  const reasonEl = document.getElementById("figure-modal-reason");
+  const reason = cleanValue(fig.reason);
+  if (reasonEl) {
+    reasonEl.textContent = reason ? `Selected because: ${reason}` : "";
+    reasonEl.hidden = !reason;
+  }
 
   const link = document.getElementById("figure-modal-link");
   if (link) {

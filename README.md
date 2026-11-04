@@ -113,8 +113,8 @@ The results area has two tabs:
   rows themselves are listed underneath. Rows
   whose paper cannot be identified are collected in a clearly labelled
   **Unlinked rows** group. A full-width **Figures** gallery below the table
-  shows the screenshots ScrapeLite detected in the archived PDFs (see
-  **Figures & tables** below).
+  shows the screenshots ScrapeLite selected for your extraction goal from the
+  archived PDFs (see **Figures & tables** below).
 
 Click any data row to select it. The panel on the right shows the paper
 metadata, the **verbatim evidence quote** for that row, its 1-based page and
@@ -643,10 +643,25 @@ PDFs leave quotes unresolved even though their extracted data is kept.
 
 ## Figures & tables
 
-During **Extract**, every paper with an archived PDF is also scanned with
-PyMuPDF for figures and tables. This works for online papers and for local PDFs
+During **Extract**, every paper with an archived PDF is scanned with PyMuPDF
+for figure/table candidates. This works for online papers and for local PDFs
 alike, runs even when `EVIDENCE_ENABLED = False`, and never fails an extraction:
-a broken PDF or missing PyMuPDF only produces a warning in the job log.
+a broken PDF, missing PyMuPDF or an unavailable LLM only produces a warning in
+the job log.
+
+Figure search is **driven by your extraction goal** (the same text you enter in
+**What data do you want from the papers?**; the CLI uses `config.INSTRUCTION`).
+To collect figures or tables, ask for them explicitly, for example:
+
+- *"Find figures showing current traces for each mutation."*
+- *"Extract the dose–response plots and the tables of kinetic parameters."*
+- *"Show images of the channel structure and any table of expression levels."*
+
+If the goal only asks for text or numbers and does not mention figures, images,
+tables, plots or other visual data, the selector returns nothing and no
+screenshots are saved. An **empty goal saves no figures**. Setting
+`FIGURES_GOAL_FILTER = False` in `config.py` restores the old behaviour of
+saving every detected candidate.
 
 The detector:
 
@@ -656,23 +671,27 @@ The detector:
    `Figure 1` or `Table 2A`;
 2. crops the nearby image/vector drawing when one exists; otherwise it takes a
    band above the caption for a lower-half figure, or below it for a typical
-   table caption. If that crop is too small, it saves the whole page so the
+   table caption. If that crop is too small, it uses the whole page so the
    caption still gets a visual;
-3. on pages with no caption, saves sufficiently large embedded images (small
-   icons and logos are skipped) with labels like `Image p.3`.
+3. on pages with no caption, considers sufficiently large embedded images
+   (small icons and logos are skipped) with labels like `Image p.3`;
+4. sends up to `FIGURE_MAX_CANDIDATES` (default `100`) candidate descriptions
+   (label, page, kind, caption) plus the goal and paper title to the configured
+   LLM, and keeps only the candidates the model says directly help answer the
+   goal. The model returns a short reason for each selection.
 
-Each screenshot is rendered at `FIGURE_DPI` (default `150`) and written as a
-PNG under `output/figures/<safe-paper-stem>/`. Duplicate crops are reused by
-their content hash, and `FIGURE_MAX_PER_PAPER` (default `50`) caps one paper;
-the job log reports when the cap was hit. The index is
-`output/figures/index.json` (relative paths only) and the same metadata is
-written to `output/figures.xlsx`.
+Only selected candidates are rendered, at `FIGURE_DPI` (default `150`), and
+written as PNGs under `output/figures/<safe-paper-stem>/`. Duplicate crops are
+reused by their content hash, and `FIGURE_MAX_PER_PAPER` (default `50`) caps one
+paper; the job log reports when a cap was hit. The index is
+`output/figures/index.json` (relative paths only) and the same metadata, now
+including the selection `reason`, is written to `output/figures.xlsx`.
 
 The **Data & PDFs** tab shows the results as a thumbnail gallery grouped by
 paper. Each thumbnail shows the label, page and a short caption; click it to
-open a full-size lightbox with the complete caption, paper title and an
-**Open image in new tab** link. The **⬇ figures.xlsx** button appears only when
-figures exist.
+open a full-size lightbox with the complete caption, paper title, the model's
+selection reason and an **Open image in new tab** link. The
+**⬇ figures.xlsx** button appears only when figures exist.
 
 A **web Search replaces the dataset**, so it also clears the figure index,
 `figures.xlsx` and cached PNGs to prevent stale thumbnails from the previous
@@ -688,10 +707,15 @@ For API/script users:
 - `GET /download/figures.xlsx` downloads the spreadsheet when it exists.
 
 Limitations: this is **PDF only** — there is no HTML/PMC figure download and
-**no OCR**, so a scanned page without a text caption produces no caption crop
-(its page may still be indexed if a caption block exists). `output/figures/`
-and `output/figures.xlsx` are git-ignored. Figure detection is controlled by
-`FIGURES_ENABLED`, `FIGURE_DPI` and `FIGURE_MAX_PER_PAPER` in `config.py`.
+**no OCR**, so a scanned page without a text caption produces no caption
+candidate (its page may still be indexed if a caption block exists). The
+detector relies on **caption text** for labelled figures/tables; uncaptioned
+large images are candidates only as `Image p.N`. Figure search is controlled by
+`FIGURES_ENABLED`, `FIGURES_GOAL_FILTER`, `FIGURE_DPI`,
+`FIGURE_MAX_CANDIDATES` and `FIGURE_MAX_PER_PAPER` in `config.py`. The LLM
+selection is advisory and can legitimately return **zero** figures for a goal
+that does not need them. `output/figures/` and `output/figures.xlsx` are
+git-ignored.
 
 ## Requirements
 

@@ -41,7 +41,8 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   JSON schema/prompt), PDF archiving, evidence/annotation settings
   (`EVIDENCE_ENABLED`, `EVIDENCE_MAX_CHARS`, `EVIDENCE_FUZZY_THRESHOLD`,
   `PDF_INDEX_JSON`, `ANNOTATED_PDF_DIR`), figure settings
-  (`FIGURES_ENABLED`, `FIGURE_DPI`, `FIGURE_MAX_PER_PAPER`, `FIGURES_DIR`,
+  (`FIGURES_ENABLED`, `FIGURES_GOAL_FILTER`, `FIGURE_DPI`,
+  `FIGURE_MAX_PER_PAPER`, `FIGURE_MAX_CANDIDATES`, `FIGURES_DIR`,
   `FIGURES_INDEX_JSON`, `FIGURES_XLSX`), prompt-history path/caps, output
   paths, Flask host/port. The web Settings panel persists
   email/model/max-results/year range/local folder to
@@ -135,18 +136,29 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   raises. `load_index()`, `api_summary()`, `resolve_paper_paths()` and
   `regenerate_annotation()` are the safe read/serve helpers (they reject
   absolute paths, `..` and escapes outside `PDF_DIR` / `ANNOTATED_PDF_DIR`).
-- `figures.py`: PDF-only figure/table detection during Extract. Uses
-  `page.get_text("dict")` caption blocks (`^(figure|fig.?|table)\s*S?\d+[A-Za-z]?\b`),
-  prefers nearby image/drawing rects, then a vertical band above/below the
-  caption, then a full-page fallback (`kind` `caption`/`image`/`page`). Renders
-  PNGs at `FIGURE_DPI` under `FIGURES_DIR/<safe-paper-stem>/`, dedupes by
-  SHA-256 of paper_key + page + kind + PNG bytes, caps at
-  `FIGURE_MAX_PER_PAPER`, and writes `output/figures/index.json`
-  (`{"version":1,"figures":[...]}`) plus `output/figures.xlsx`. All operations
-  are best-effort and never raise into extraction. `process_paper()` replaces
-  only that paper's index entries; `clear()` (web search only) removes the
-  index, xlsx and cached PNG dirs. The index stores POSIX relative paths only;
-  `resolve_figure_path()`/`api_list()` validate them under `FIGURES_DIR`.
+- `figures.py`: PDF-only, goal-driven figure/table search during Extract.
+  `_page_candidates()` finds `page.get_text("dict")` caption blocks
+  (`^(figure|fig.?|table)\s*S?\d+[A-Za-z]?\b`), prefers nearby image/drawing
+  rects, then a vertical band above/below the caption, then a full-page
+  fallback (`kind` `caption`/`image`/`page`). `_detect()` collects candidate
+  descriptors while the PyMuPDF document is open, caps them at
+  `FIGURE_MAX_CANDIDATES`, and (unless `goal is None` or
+  `FIGURES_GOAL_FILTER=False`) calls `select_figures_for_goal()`; only selected
+  candidates are rendered. The selector uses `suggester._require_backend()` /
+  `_call_llm()` / `_load_json_object()` with a `{"selected":[{"id","reason"}]}`
+  JSON schema and ignores unknown/duplicate ids. Empty goals skip the LLM and
+  save nothing; backend/parse failures are warnings and save nothing. PNGs are
+  written at `FIGURE_DPI` under `FIGURES_DIR/<safe-paper-stem>/`, deduped by
+  SHA-256 of paper_key + page + kind + PNG bytes, capped at
+  `FIGURE_MAX_PER_PAPER`, and registered in `output/figures/index.json`
+  (`{"version":1,"figures":[...]}`) plus `output/figures.xlsx`; entries carry
+  the model's `reason` (empty for legacy/all mode). All operations are
+  best-effort and never raise into extraction. `process_paper(pdf_path,
+  paper_key, title="", pdf_file="", pdf_source="", goal=None,
+  goal_filter=None)` replaces only that paper's index entries; `clear()` (web
+  search only) removes the index, xlsx and cached PNG dirs. The index stores
+  POSIX relative paths only; `resolve_figure_path()`/`api_list()` validate them
+  under `FIGURES_DIR`.
 - `extractor.py`: Ollama path constrains output with the JSON schema and expects a
   bare array; OpenAI JSON mode requires the `{"items": [...]}` object wrapper.
   Both shapes plus fenced/prose fallbacks are handled in `_parse_response`.
@@ -223,7 +235,8 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   highlights `preprint` cells. A full-width `#figures-section` below
   `.data-layout` renders `data.figures` as paper-grouped lazy thumbnails
   (`/api/figure/<id>`) with a no-dependency
-  lightbox (backdrop/Escape/close, label, page, caption, new-tab link); the
+  lightbox (backdrop/Escape/close, label, page, caption, selection reason when
+  present, new-tab link); the
   section and `figures.xlsx` buttons are hidden when the list is empty.
   `#progress-card` also hosts the `#cancel-job` button: it is visible only while
   a job is `running`, posts to the cancel endpoint, disables itself and shows
@@ -296,22 +309,32 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   resolves, so the viewer can show the original. The index/annotations store
   basenames only; never add an API/serving path that accepts a caller-supplied
   filename. There is **no OCR**: image-only PDFs leave quotes unresolved.
-- **Figure detection is independent, best-effort and PDF-only:** both
+- **Figure search is goal-driven, best-effort and PDF-only:** both
   `main.run_extract()` and `app._run_extract_job()` call
   `figures.process_paper()` whenever `FIGURES_ENABLED` and `pdf.get("path")`
   exist — after the annotation block, before/around the Excel write, even when
-  `EVIDENCE_ENABLED = False` and even when the model returned zero records. A
-  failure only logs `figure warning`; extraction continues. Figures apply to
-  local PDFs too (they have archived paths). Web search calls `figures.clear()`
-  when it replaces the dataset (index + `figures.xlsx` + cached PNG dirs);
-  CLI search merges and must never clear them. `process_paper()` replaces only
-  that paper's index entries, so re-extraction cannot leave stale figures.
-  Detection uses captions plus nearby image/drawing rects, a caption band or a
-  full-page fallback (`kind` `caption`/`image`/`page`), then large embedded
-  images on uncaptioned pages. It is **PDF-only**, with **no OCR** and no
-  HTML/PMC figure download. Index paths are POSIX relative names validated
-  under `FIGURES_DIR`; never accept a caller-supplied path. Orphan PNGs from
-  older versions may remain, but only index entries are served.
+  `EVIDENCE_ENABLED = False` and even when the model returned zero records.
+  The web job passes the user's `goal`; the CLI passes `config.INSTRUCTION`.
+  With the default `FIGURES_GOAL_FILTER=True`, the goal is sent to the
+  configured LLM and only matching candidates are saved. A goal that does not
+  ask for figures/images/tables/visual data (and an empty goal, which skips the
+  LLM) saves none. `goal=None` preserves legacy all-figures behaviour for
+  direct callers/tests; `FIGURES_GOAL_FILTER=False` restores it for the
+  pipeline. A backend/parse failure only logs `Figure warning: …`; extraction
+  continues. Figures apply to local PDFs too (they have archived paths). Web
+  search calls `figures.clear()` when it replaces the dataset (index +
+  `figures.xlsx` + cached PNG dirs); CLI search merges and must never clear
+  them. `process_paper()` replaces only that paper's index entries, so
+  re-extraction cannot leave stale figures. Detection uses captions plus nearby
+  image/drawing rects, a caption band or a full-page fallback (`kind`
+  `caption`/`image`/`page`), then large embedded images on uncaptioned pages.
+  It is **PDF-only**, with **no OCR**, no HTML/PMC figure download, and relies
+  on caption text for labelled figures/tables. Index paths are POSIX relative
+  names validated under `FIGURES_DIR`; never accept a caller-supplied path.
+  Orphan PNGs from older versions may remain, but only index entries are
+  served. The web job result adds `figures_candidates`, `figures_matched`,
+  `figures_skipped` and `figure_candidate_capped` next to the saved/duplicate/
+  capped/warning counters.
 - **Improve goal is advisory and side-effect free:** the button only rewrites
   goal text. It must never start/queue an extraction, write `web_settings.json`,
   save a run state, or record prompt history; those happen when the user clicks
@@ -379,7 +402,8 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   (global web prompt history, git-ignored), `pdfs/`, `pdf_index.json`
   (evidence/annotation index, git-ignored), `annotated_pdfs/` (cached
   highlighted copies, git-ignored), `figures/` (figure index + cached PNGs,
-  git-ignored), `figures.xlsx` (figure metadata, covered by `output/*.xlsx`).
+  git-ignored), `figures.xlsx` (figure metadata including the selection
+  `reason`, covered by `output/*.xlsx`).
   With runs enabled these same files live under `output/runs/<run-id>/`; the
   global copies remain for CLI/legacy use. `output/active_run.json` is the
   loaded-run marker and `output/runs/` is a dataset container; both are

@@ -808,7 +808,8 @@ def _run_extract_job(job, goal, columns, mode="records"):
         n_evidence_located = n_evidence_unresolved = 0
         n_annotation_warnings = 0
         n_figures_saved = n_figure_duplicates = n_figures_capped = 0
-        n_figure_warnings = 0
+        n_figures_candidates = n_figures_matched = n_figures_skipped = 0
+        n_figure_candidate_capped = n_figure_warnings = 0
         first_write = True
         processed = 0
         cancelled = False
@@ -891,8 +892,9 @@ def _run_extract_job(job, goal, columns, mode="records"):
                     n_annotation_warnings += 1
                     job["log"].append(f"   !! evidence warning: {exc}")
 
-            # Figure screenshots are independent of evidence and of the number
-            # of extracted rows. Best-effort: never fail the extraction job.
+            # Goal-driven figure search is independent of evidence and of the
+            # number of extracted rows: only candidates matching the extraction
+            # goal are saved. Best-effort: never fail the extraction job.
             if getattr(config, "FIGURES_ENABLED", True) and pdf.get("path"):
                 try:
                     figure_summary = figures.process_paper(
@@ -901,15 +903,27 @@ def _run_extract_job(job, goal, columns, mode="records"):
                         title=p.get("title", ""),
                         pdf_file=pdf_file,
                         pdf_source=pdf_source,
+                        goal=goal,
                     )
                     n_figures_saved += int(
                         (figure_summary or {}).get("saved") or 0
+                    )
+                    n_figures_candidates += int(
+                        (figure_summary or {}).get("candidates") or 0
+                    )
+                    n_figures_matched += int(
+                        (figure_summary or {}).get("matched") or 0
+                    )
+                    n_figures_skipped += int(
+                        (figure_summary or {}).get("skipped") or 0
                     )
                     n_figure_duplicates += int(
                         (figure_summary or {}).get("duplicates") or 0
                     )
                     if (figure_summary or {}).get("capped"):
                         n_figures_capped += 1
+                    if (figure_summary or {}).get("candidate_capped"):
+                        n_figure_candidate_capped += 1
                     if (figure_summary or {}).get("warning"):
                         n_figure_warnings += 1
                     message = figures.summary_message(figure_summary)
@@ -954,8 +968,12 @@ def _run_extract_job(job, goal, columns, mode="records"):
             "evidence_unresolved": n_evidence_unresolved,
             "annotation_warnings": n_annotation_warnings,
             "figures_saved": n_figures_saved,
+            "figures_candidates": n_figures_candidates,
+            "figures_matched": n_figures_matched,
+            "figures_skipped": n_figures_skipped,
             "figure_duplicates": n_figure_duplicates,
             "figures_capped": n_figures_capped,
+            "figure_candidate_capped": n_figure_candidate_capped,
             "figure_warnings": n_figure_warnings,
             "cancelled": cancelled,
         }
