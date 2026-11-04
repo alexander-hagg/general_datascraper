@@ -68,8 +68,10 @@ class FigureTestBase(unittest.TestCase):
         self.xlsx_path = self.dir / "figures.xlsx"
         patches = [
             mock.patch.object(config, "FIGURES_ENABLED", True),
+            mock.patch.object(config, "FIGURES_GOAL_FILTER", True),
             mock.patch.object(config, "FIGURE_DPI", 100),
             mock.patch.object(config, "FIGURE_MAX_PER_PAPER", 50),
+            mock.patch.object(config, "FIGURE_MAX_CANDIDATES", 100),
             mock.patch.object(config, "FIGURES_DIR", self.figures_dir),
             mock.patch.object(config, "FIGURES_INDEX_JSON", self.index_path),
             mock.patch.object(config, "FIGURES_XLSX", self.xlsx_path),
@@ -212,6 +214,290 @@ class DetectionTests(FigureTestBase):
             summary = figures.process_paper(pdf, "pmid:nopymupdf")
         self.assertEqual(summary["saved"], 0)
         self.assertIn("PyMuPDF", summary["warning"])
+
+
+def candidate(candidate_id, label="Figure 1", page=1, kind="caption",
+              caption="Dose response of the mutant."):
+    return {
+        "id": candidate_id,
+        "page_number": page,
+        "kind": kind,
+        "label": label,
+        "caption": caption,
+    }
+
+
+class GoalSelectionUnitTests(unittest.TestCase):
+    def _select(self, raw, goal="Find figures showing current traces",
+                title="A paper title", candidates=None):
+        candidates = candidates or [
+            candidate("c1", "Figure 1"),
+            candidate("c2", "Figure 2", page=2),
+        ]
+        with mock.patch.object(figures.suggester, "_require_backend"), \
+             mock.patch.object(
+                 figures.suggester, "_call_llm", return_value=raw
+             ) as call_llm:
+            result = figures.select_figures_for_goal(
+                candidates, goal, title=title
+            )
+        return result, call_llm
+
+    def test_selects_only_known_ids_and_dedupes(self):
+        result, _ = self._select(json.dumps({"selected": [
+            {"id": "c2", "reason": "Shows the current traces."},
+            {"id": "missing", "reason": "Invented id."},
+            {"id": "c2", "reason": "Duplicate id."},
+        ]}))
+        self.assertEqual(
+            [item["id"] for item in result["selected"]], ["c2"]
+        )
+        self.assertEqual(
+            result["selected"][0]["reason"], "Shows the current traces."
+        )
+        self.assertIn("unknown figure id", result["warning"])
+        self.assertIn("duplicate figure id", result["warning"])
+        self.assertFalse(result["capped"])
+
+    def test_malformed_responses_are_warnings(self):
+        for raw in ("not json", '{"selected": "c1"}', "[]"):
+            with self.subTest(raw=raw):
+                result, _ = self._select(raw)
+                self.assertEqual(result["selected"], [])
+                self.assertTrue(result["warning"])
+
+    def test_backend_unavailable_and_llm_exception_are_warnings(self):
+        candidates = [candidate("c1")]
+        with mock.patch.object(
+            figures.suggester,
+            "_require_backend",
+            side_effect=figures.suggester.BackendUnavailable("offline"),
+        ):
+            result = figures.select_figures_for_goal(
+                candidates, "Find current traces"
+            )
+        self.assertEqual(result["selected"], [])
+        self.assertIn("backend is unavailable", result["warning"])
+
+        with mock.patch.object(figures.suggester, "_require_backend"), \
+             mock.patch.object(
+                 figures.suggester,
+                 "_call_llm",
+                 side_effect=RuntimeError("model exploded"),
+             ):
+            result = figures.select_figures_for_goal(
+                candidates, "Find current traces"
+            )
+        self.assertEqual(result["selected"], [])
+        self.assertIn("Figure selection failed", result["warning"])
+
+    def test_empty_goal_does_not_call_the_backend(self):
+        with mock.patch.object(
+            figures.suggester,
+            "_require_backend",
+            side_effect=AssertionError("backend must not be called"),
+        ):
+            result = figures.select_figures_for_goal(
+                [candidate("c1")], "   "
+            )
+        self.assertTrue(result["goal_empty"])
+        self.assertEqual(result["selected"], [])
+        self.assertIn("goal is empty", result["warning"])
+
+    def test_selection_is_capped_at_max_figures(self):
+        candidates = [candidate(f"c{i}", label=f"Figure {i}") for i in range(1, 4)]
+        with mock.patch.object(config, "FIGURE_MAX_PER_PAPER", 2):
+            result, _ = self._select(
+                json.dumps({"selected": [
+                    {"id": "c1", "reason": "one"},
+                    {"id": "c2", "reason": "two"},
+                    {"id": "c3", "reason": "three"},
+                ]}),
+                candidates=candidates,
+            )
+        self.assertEqual([item["id"] for item in result["selected"]], ["c1", "c2"])
+        self.assertTrue(result["capped"])
+
+    def test_prompt_and_schema_include_goal_title_and_candidate_metadata(self):
+        raw = json.dumps({"selected": []})
+        result, call_llm = self._select(
+            raw,
+            goal="Find figures showing current traces for each mutation",
+            title="Mutant channel paper",
+        )
+        self.assertEqual(result["selected"], [])
+        prompt, schema = call_llm.call_args.args
+        self.assertIn("current traces for each mutation", prompt)
+        self.assertIn("Mutant channel paper", prompt)
+        self.assertIn("Figure 2", prompt)
+        self.assertIn("page: 2", prompt)
+        self.assertIn("kind: caption", prompt)
+        self.assertIn("Dose response of the mutant", prompt)
+        self.assertIn("Do not select figures merely because they exist", prompt)
+        self.assertIn("return an empty list", prompt)
+        self.assertEqual(schema["required"], ["selected"])
+
+
+class GoalFilteredProcessTests(FigureTestBase):
+    def _three_figure_pdf(self):
+        return make_pdf(
+            self.dir / "goal.pdf",
+            [
+                caption_page("Figure 1. First current trace."),
+                caption_page("Figure 2. Second current trace."),
+                caption_page("Figure 3. Third current trace."),
+            ],
+        )
+
+    def _process(self, pdf, goal, raw, **kwargs):
+        with mock.patch.object(figures.suggester, "_require_backend"), \
+             mock.patch.object(
+                 figures.suggester, "_call_llm", return_value=raw
+             ) as call_llm:
+            summary = figures.process_paper(
+                pdf, "pmid:goal", title="Goal paper", goal=goal, **kwargs
+            )
+        return summary, call_llm
+
+    def test_only_selected_candidates_are_rendered_indexed_and_written(self):
+        pdf = self._three_figure_pdf()
+        summary, _ = self._process(
+            pdf,
+            "Find figures showing current traces for each mutation",
+            json.dumps({"selected": [
+                {"id": "c2", "reason": "Shows current traces for the mutation."}
+            ]}),
+        )
+        self.assertEqual(summary["candidates"], 3)
+        self.assertEqual(summary["matched"], 1)
+        self.assertEqual(summary["skipped"], 2)
+        self.assertTrue(summary["goal_filtered"])
+        self.assertEqual(summary["saved"], 1)
+
+        entries = figures.load_index()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["label"], "Figure 2")
+        self.assertEqual(
+            entries[0]["reason"], "Shows current traces for the mutation."
+        )
+        self.assertEqual(
+            figures.api_list("pmid:goal")[0]["reason"],
+            "Shows current traces for the mutation.",
+        )
+        pngs = list(self.figures_dir.rglob("*.png"))
+        self.assertEqual(len(pngs), 1)
+
+        table = read_sheet(self.xlsx_path)
+        row = dict(zip(table[0], table[1]))
+        self.assertEqual(row["reason"], "Shows current traces for the mutation.")
+        self.assertIn(
+            "1 figure screenshot(s) matched the extraction goal "
+            "(from 3 candidate(s))",
+            figures.summary_message(summary),
+        )
+
+    def test_goal_without_a_figure_request_saves_none(self):
+        pdf = self._three_figure_pdf()
+        summary, _ = self._process(
+            pdf, "Extract mutation effects", json.dumps({"selected": []})
+        )
+        self.assertEqual(summary["saved"], 0)
+        self.assertEqual(summary["matched"], 0)
+        self.assertEqual(summary["skipped"], 3)
+        self.assertEqual(figures.load_index(), [])
+        self.assertEqual(list(self.figures_dir.rglob("*.png")), [])
+        self.assertEqual(
+            figures.summary_message(summary),
+            "No figures matched the extraction goal (3 candidate(s) skipped).",
+        )
+
+    def test_empty_goal_saves_none_without_the_backend_and_clears_old_entries(self):
+        pdf = self._three_figure_pdf()
+        figures.process_paper(pdf, "pmid:goal")
+        self.assertEqual(len(figures.load_index()), 3)
+        with mock.patch.object(
+            figures.suggester,
+            "_require_backend",
+            side_effect=AssertionError("backend must not be called"),
+        ), mock.patch.object(
+            figures.suggester,
+            "_call_llm",
+            side_effect=AssertionError("LLM must not be called"),
+        ):
+            summary = figures.process_paper(
+                pdf, "pmid:goal", goal="   "
+            )
+        self.assertEqual(summary["saved"], 0)
+        self.assertTrue(summary["goal_empty"])
+        self.assertIn("goal is empty", figures.summary_message(summary))
+        self.assertEqual(figures.load_index(), [])
+        table = read_sheet(self.xlsx_path)
+        self.assertEqual(table, [figures.FIGURE_COLUMNS])
+
+    def test_goal_none_preserves_legacy_all_figures(self):
+        pdf = self._three_figure_pdf()
+        with mock.patch.object(
+            figures.suggester,
+            "_require_backend",
+            side_effect=AssertionError("legacy mode must not call the LLM"),
+        ):
+            summary = figures.process_paper(pdf, "pmid:goal")
+        self.assertEqual(summary["saved"], 3)
+        self.assertFalse(summary["goal_filtered"])
+        self.assertTrue(
+            all(entry["reason"] == "" for entry in figures.load_index())
+        )
+        self.assertIn(
+            "3 figure screenshot(s) saved", figures.summary_message(summary)
+        )
+
+    def test_goal_filter_disabled_selects_all_figures(self):
+        pdf = self._three_figure_pdf()
+        with mock.patch.object(config, "FIGURES_GOAL_FILTER", False), \
+             mock.patch.object(
+                 figures.suggester,
+                 "_require_backend",
+                 side_effect=AssertionError("disabled filter must not call the LLM"),
+             ):
+            summary = figures.process_paper(
+                pdf, "pmid:goal", goal="Find figures showing current traces"
+            )
+        self.assertEqual(summary["saved"], 3)
+        self.assertFalse(summary["goal_filtered"])
+        self.assertEqual(len(figures.load_index()), 3)
+
+    def test_candidate_cap_limits_the_prompt(self):
+        pdf = self._three_figure_pdf()
+        with mock.patch.object(config, "FIGURE_MAX_CANDIDATES", 2):
+            summary, call_llm = self._process(
+                pdf,
+                "Find current traces",
+                json.dumps({"selected": [
+                    {"id": "c1", "reason": "First trace."}
+                ]}),
+            )
+            message = figures.summary_message(summary)
+        prompt, _schema = call_llm.call_args.args
+        self.assertIn("id: c1", prompt)
+        self.assertIn("id: c2", prompt)
+        self.assertNotIn("id: c3", prompt)
+        self.assertEqual(summary["candidates"], 2)
+        self.assertTrue(summary["candidate_capped"])
+        self.assertIn("candidate list capped at 2", message)
+
+    def test_backend_failure_is_a_warning_not_an_exception(self):
+        pdf = self._three_figure_pdf()
+        with mock.patch.object(
+            figures.suggester,
+            "_require_backend",
+            side_effect=figures.suggester.BackendUnavailable("offline"),
+        ):
+            summary = figures.process_paper(
+                pdf, "pmid:goal", goal="Find current traces"
+            )
+        self.assertEqual(summary["saved"], 0)
+        self.assertIn("backend is unavailable", summary["warning"])
+        self.assertTrue(figures.summary_message(summary).startswith("Figure warning:"))
 
 
 class IndexTests(FigureTestBase):
@@ -465,6 +751,7 @@ class IntegrationTests(FigureTestBase):
         self.assertEqual(len(processed), 1)
         self.assertEqual(processed[0][0][0], pdf)
         self.assertEqual(processed[0][0][1], "pmid:111")
+        self.assertEqual(processed[0][1]["goal"], main.config.INSTRUCTION)
 
     def test_main_figure_failure_does_not_lose_extraction(self):
         pdf = self.paper_pdf()
@@ -553,14 +840,34 @@ class IntegrationTests(FigureTestBase):
             return job
 
     def test_web_extract_reports_figure_counts(self):
-        job = self._run_web_extract(lambda *a, **k: {
-            "saved": 2, "duplicates": 1, "capped": True, "warning": "",
+        process_mock = mock.Mock(return_value={
+            "saved": 2,
+            "candidates": 5,
+            "matched": 2,
+            "skipped": 3,
+            "duplicates": 1,
+            "capped": True,
+            "candidate_capped": True,
+            "goal_filtered": True,
+            "warning": "",
         })
+        job = self._run_web_extract(process_mock)
         self.assertEqual(job["status"], "done")
         self.assertEqual(job["result"]["figures_saved"], 2)
+        self.assertEqual(job["result"]["figures_candidates"], 5)
+        self.assertEqual(job["result"]["figures_matched"], 2)
+        self.assertEqual(job["result"]["figures_skipped"], 3)
         self.assertEqual(job["result"]["figure_duplicates"], 1)
         self.assertEqual(job["result"]["figures_capped"], 1)
-        self.assertIn("2 figure screenshot(s) saved", "\n".join(job["log"]))
+        self.assertEqual(job["result"]["figure_candidate_capped"], 1)
+        self.assertEqual(
+            process_mock.call_args.kwargs["goal"], "Extract mutations"
+        )
+        self.assertIn(
+            "2 figure screenshot(s) matched the extraction goal "
+            "(from 5 candidate(s))",
+            "\n".join(job["log"]),
+        )
 
     def test_web_extract_figure_failure_only_warns(self):
         job = self._run_web_extract(

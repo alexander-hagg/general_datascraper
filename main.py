@@ -517,9 +517,10 @@ def run_extract(limit=None, papers=None, mode="records"):
             except Exception as exc:  # noqa: BLE001 - evidence is best-effort
                 print(f"  !! evidence warning: {exc}")
 
-        # Detect figure/table screenshots in the archived PDF. Independent of
-        # evidence and of the number of extracted rows: the gallery is useful
-        # even when the model returned zero records. Never fatal.
+        # Search the archived PDF for figures/tables that help answer the
+        # configured extraction instruction. Independent of evidence and of the
+        # number of extracted rows; an empty instruction saves no figures when
+        # goal filtering is enabled. Never fatal.
         if getattr(config, "FIGURES_ENABLED", True) and pdf.get("path"):
             try:
                 figure_summary = figures.process_paper(
@@ -528,6 +529,7 @@ def run_extract(limit=None, papers=None, mode="records"):
                     title=p.get("title", ""),
                     pdf_file=pdf_file,
                     pdf_source=pdf_source,
+                    goal=config.INSTRUCTION,
                 )
                 message = figures.summary_message(figure_summary)
                 if message:

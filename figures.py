@@ -1,21 +1,31 @@
 """
-figures.py — detect figures/tables in archived PDFs and cache PNG screenshots.
+figures.py — goal-driven figure/table search in archived PDFs.
 
 During Extract, every paper that has an archived PDF is scanned with PyMuPDF:
 
 1. caption blocks starting with ``Figure``/``Fig.`` or ``Table`` are located;
-2. a crop around the caption is rendered (nearby images/drawings first, then a
+2. a crop around the caption is described (nearby images/drawings first, then a
    vertical band above/below, then the whole page as a last resort);
 3. pages without captions contribute large embedded images;
-4. PNGs are stored under ``output/figures/<safe-paper-stem>/`` and registered in
-   ``output/figures/index.json`` plus ``output/figures.xlsx``.
+4. all candidates are collected while the document is open;
+5. the extraction goal is sent to the configured LLM together with the
+   candidate metadata and only the selected candidates are rendered;
+6. PNGs are stored under ``output/figures/<safe-paper-stem>/`` and registered in
+   ``output/figures/index.json`` plus ``output/figures.xlsx`` with the model's
+   reason.
 
-Everything here is best-effort. A broken PDF, a missing PyMuPDF install or an
-unreadable index must never fail an extraction run. The index stores POSIX
-relative paths only; API helpers resolve and validate those paths so a caller
-can never request an arbitrary file. Scope is PDF only — there is no OCR and no
-HTML/PMC figure download. Orphan PNGs from older versions may remain on disk;
-the index (not the folder) is the source of truth.
+Normal extraction is goal-filtered: if the goal does not ask for figures,
+images, tables or visual data, no screenshots are saved. A ``goal`` of ``None``
+keeps the legacy all-figures behaviour for direct callers/tests, and
+``config.FIGURES_GOAL_FILTER = False`` restores it for the pipeline.
+
+Everything here is best-effort. A broken PDF, a missing PyMuPDF install, an
+unreachable LLM backend or an unreadable index must never fail an extraction
+run. The index stores POSIX relative paths only; API helpers resolve and
+validate those paths so a caller can never request an arbitrary file. Scope is
+PDF only — there is no OCR and no HTML/PMC figure download. Orphan PNGs from
+older versions may remain on disk; the index (not the folder) is the source of
+truth.
 """
 
 import hashlib
@@ -30,6 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import config
+import suggester
 import writer
 
 try:  # PyMuPDF >= 1.24 ships the modern `pymupdf` import name.
@@ -42,7 +53,7 @@ PYMUPDF_AVAILABLE = pymupdf is not None
 INDEX_VERSION = 1
 FIGURE_KINDS = ("caption", "image", "page")
 FIGURE_COLUMNS = [
-    "id", "paper_key", "title", "label", "caption", "page", "file",
+    "id", "paper_key", "title", "label", "caption", "reason", "page", "file",
     "kind", "width", "height", "dpi", "created_at",
 ]
 
@@ -59,6 +70,28 @@ _INDEX_LOCK = threading.RLock()
 _MIN_CROP_WIDTH = 60.0
 _MIN_CROP_HEIGHT = 40.0
 _MAX_CAPTION_CHARS = 1000
+_MAX_REASON_CHARS = 300
+_MAX_PROMPT_CAPTION_CHARS = 500
+_MAX_PROMPT_TITLE_CHARS = 300
+_MAX_PROMPT_GOAL_CHARS = 2000
+
+_FIGURE_SELECTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "selected": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["id", "reason"],
+            },
+        },
+    },
+    "required": ["selected"],
+}
 
 
 # --------------------------------------------------------------------------
@@ -87,6 +120,21 @@ def _max_figures():
     except (TypeError, ValueError):
         value = 50
     return max(1, value)
+
+
+def _max_candidates():
+    try:
+        value = int(getattr(config, "FIGURE_MAX_CANDIDATES", 100))
+    except (TypeError, ValueError):
+        value = 100
+    return max(1, value)
+
+
+def _goal_filter(value=None):
+    """Resolve the goal filter: explicit argument first, then config."""
+    if value is not None:
+        return bool(value)
+    return bool(getattr(config, "FIGURES_GOAL_FILTER", True))
 
 
 def _figures_dir():
@@ -239,6 +287,7 @@ def _clean_entry(entry):
         "title": _clean_text(entry.get("title"), 500),
         "label": _clean_text(entry.get("label"), 200),
         "caption": _clean_text(entry.get("caption"), _MAX_CAPTION_CHARS),
+        "reason": _clean_text(entry.get("reason"), _MAX_REASON_CHARS),
         "page": page,
         "file": relative,
         "kind": kind,
@@ -675,28 +724,208 @@ def _write_png(target, png_bytes):
     return target
 
 
-def _detect(pdf_path, paper_key, title="", dpi=None):
-    """Internal detector: returns ``(entries, stats)`` and may raise."""
+# --------------------------------------------------------------------------
+# Goal-driven selection
+# --------------------------------------------------------------------------
+
+def _candidate_prompt(candidates, goal, title=""):
+    """Build the figure-selection prompt from candidate metadata only."""
+    clean_goal = _clean_text(goal, _MAX_PROMPT_GOAL_CHARS)
+    clean_title = _clean_text(title, _MAX_PROMPT_TITLE_CHARS)
+    lines = [
+        "You are selecting figures and tables from one research paper for a "
+        "data-extraction task.",
+        f'Extraction goal: "{clean_goal}"',
+        f'Paper title: "{clean_title}"',
+        "",
+        "Candidate figures/tables:",
+    ]
+    for candidate in candidates:
+        candidate_id = str(candidate.get("id") or "").strip()
+        label = _clean_text(candidate.get("label"), 200) or "(no label)"
+        page = candidate.get("page_number")
+        if page is None:
+            page = candidate.get("page")
+        kind = _clean_text(candidate.get("kind"), 40) or "caption"
+        caption = _clean_text(
+            candidate.get("caption"), _MAX_PROMPT_CAPTION_CHARS
+        ) or "(no caption text)"
+        lines.append(
+            f"- id: {candidate_id} | label: {label} | page: {page} | "
+            f"kind: {kind} | caption: {caption}"
+        )
+    lines.extend([
+        "",
+        "Rules:",
+        "- Select only candidates that directly help answer the extraction goal.",
+        "- Do not select figures merely because they exist.",
+        "- If the goal does not ask for figures/images/tables/visual data, "
+        "return an empty list.",
+        "- Return an empty list if no figures are requested by the goal.",
+        "- Use only the ids listed above; never invent an id.",
+        "- Keep each reason to one short sentence.",
+        f"- Select at most {_max_figures()} candidate(s).",
+        "",
+        'Return a JSON object with one key, "selected", whose value is an array '
+        'of objects like {"id": "c1", "reason": "why it helps answer the goal"}. '
+        "Return ONLY the JSON object (no prose, no markdown).",
+    ])
+    return "\n".join(lines)
+
+
+def select_figures_for_goal(candidates, goal, title=""):
+    """Ask the configured LLM which candidates help answer the extraction goal.
+
+    Returns ``{"selected": [{"id", "reason"}], "warning": str, "capped": bool,
+    "goal_empty": bool}``. Model output is validated against the candidate ids,
+    deduped and capped at ``FIGURE_MAX_PER_PAPER``. Backend/parse failures are
+    reported as a warning with an empty selection; this function never raises.
+    """
+    result = {
+        "selected": [],
+        "warning": "",
+        "capped": False,
+        "goal_empty": False,
+    }
+    clean_goal = _clean_text(goal, _MAX_PROMPT_GOAL_CHARS)
+    if not clean_goal:
+        result["goal_empty"] = True
+        result["warning"] = (
+            "No figures were requested because the extraction goal is empty."
+        )
+        return result
+
+    known = {}
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get("id") or "").strip()
+        if candidate_id and candidate_id not in known:
+            known[candidate_id] = candidate
+    if not known:
+        return result
+
+    try:
+        suggester._require_backend()
+        raw = suggester._call_llm(
+            _candidate_prompt(list(known.values()), clean_goal, title),
+            _FIGURE_SELECTION_SCHEMA,
+        )
+    except suggester.BackendUnavailable as exc:
+        result["warning"] = (
+            "Figure selection was skipped because the LLM backend is "
+            f"unavailable: {exc}"
+        )
+        return result
+    except Exception as exc:  # noqa: BLE001 - figures must never fail extraction
+        result["warning"] = f"Figure selection failed: {exc}"
+        return result
+
+    try:
+        data = suggester._load_json_object(raw or "")
+    except Exception as exc:  # noqa: BLE001 - malformed output is non-fatal
+        result["warning"] = f"Could not parse the figure selection: {exc}"
+        return result
+    if not isinstance(data, dict):
+        result["warning"] = "The figure-selection response was not valid JSON."
+        return result
+    items = data.get("selected")
+    if not isinstance(items, list):
+        result["warning"] = (
+            'The figure-selection response did not contain a "selected" list.'
+        )
+        return result
+
+    selected, seen = [], set()
+    unknown = duplicates = 0
+    for item in items:
+        if isinstance(item, str):
+            candidate_id, reason = item, ""
+        elif isinstance(item, dict):
+            candidate_id = item.get("id")
+            reason = item.get("reason")
+        else:
+            continue
+        candidate_id = str(candidate_id or "").strip()
+        if not candidate_id:
+            continue
+        if candidate_id in seen:
+            duplicates += 1
+            continue
+        seen.add(candidate_id)
+        if candidate_id not in known:
+            unknown += 1
+            continue
+        selected.append({
+            "id": candidate_id,
+            "reason": _clean_text(reason, _MAX_REASON_CHARS),
+        })
+
+    notes = []
+    if unknown:
+        notes.append(f"Ignored {unknown} unknown figure id(s) from the model.")
+    if duplicates:
+        notes.append(f"Ignored {duplicates} duplicate figure id(s) from the model.")
+    result["warning"] = " ".join(notes)
+
+    cap = _max_figures()
+    if len(selected) > cap:
+        selected = selected[:cap]
+        result["capped"] = True
+    result["selected"] = selected
+    return result
+
+
+def _detect_stats(**values):
+    stats = {
+        "candidates": 0,
+        "matched": 0,
+        "skipped": 0,
+        "duplicates": 0,
+        "capped": False,
+        "candidate_capped": False,
+        "goal_filtered": False,
+        "goal_empty": False,
+        "warning": "",
+    }
+    stats.update(values)
+    return stats
+
+
+def _detect(pdf_path, paper_key, title="", dpi=None, goal=None, goal_filter=None):
+    """Internal detector: returns ``(entries, stats)`` and may raise.
+
+    Candidates are collected while the PyMuPDF document is open, the extraction
+    goal selects a subset (unless ``goal`` is None or filtering is disabled),
+    and only selected candidates are rendered.
+    """
     key = str(paper_key or "").strip()
+    filtering = _goal_filter(goal_filter)
+    goal_text = None if goal is None else _clean_text(goal, _MAX_PROMPT_GOAL_CHARS)
+    goal_filtered = bool(filtering and goal is not None)
+    goal_empty = bool(goal_filtered and not goal_text)
     if not _enabled() or not _pymupdf_available() or not key:
-        return [], {"duplicates": 0, "capped": False, "warning": ""}
+        return [], _detect_stats(goal_filtered=goal_filtered)
     source = Path(str(pdf_path)).expanduser()
     if not source.is_file():
-        return [], {
-            "duplicates": 0,
-            "capped": False,
-            "warning": "PDF file not found; no figures were detected.",
-        }
+        return [], _detect_stats(
+            goal_filtered=goal_filtered,
+            warning="PDF file not found; no figures were detected.",
+        )
+    if goal_empty:
+        return [], _detect_stats(goal_filtered=True, goal_empty=True)
 
     dpi = _dpi(dpi)
     max_figures = _max_figures()
+    max_candidates = _max_candidates() if goal_filtered else None
     stem = _safe_stem(key)
-    base = _figures_dir()
     seen = set()
     entries = []
     duplicates = 0
     capped = False
-    warning = ""
+    candidate_capped = False
+    scanning_warnings = []
+    candidates = []
 
     document = pymupdf.open(str(source))
     try:
@@ -704,80 +933,146 @@ def _detect(pdf_path, paper_key, title="", dpi=None):
             page_number = page_index + 1
             try:
                 blocks = _page_blocks(page)
-                candidates = _page_candidates(page, page_number, blocks)
+                page_candidates = _page_candidates(page, page_number, blocks)
             except Exception as exc:  # one malformed page must not lose the rest
-                warning = f"Could not scan page {page_number}: {exc}"
+                scanning_warnings.append(
+                    f"Could not scan page {page_number}: {exc}"
+                )
                 continue
 
-            for candidate in candidates:
-                if len(entries) >= max_figures:
-                    capped = True
+            for item in page_candidates:
+                if max_candidates is not None and len(candidates) >= max_candidates:
+                    candidate_capped = True
                     break
-                try:
-                    png, width, height = _render_png(
-                        page, candidate["rect"], dpi
-                    )
-                except Exception as exc:
-                    warning = f"Could not render page {page_number}: {exc}"
-                    continue
-                if not png:
-                    continue
-                figure_id = _figure_id(key, page_number, candidate["kind"], png)
-                if figure_id in seen:
-                    duplicates += 1
-                    continue
-                seen.add(figure_id)
-                relative = f"{stem}/fig_{figure_id}.png"
-                target = _safe_figure_path(relative, must_exist=False)
-                if target is None:
-                    warning = "Could not resolve the figure output path."
-                    continue
-                if target.is_file():
-                    duplicates += 1
-                else:
-                    try:
-                        _write_png(target, png)
-                    except OSError as exc:
-                        warning = f"Could not save a figure PNG: {exc}"
-                        continue
-                entries.append({
-                    "id": figure_id,
-                    "paper_key": key,
-                    "title": _clean_text(title, 500),
-                    "label": candidate["label"],
-                    "caption": candidate["caption"],
-                    "page": page_number,
-                    "file": relative,
-                    "kind": candidate["kind"],
-                    "width": width,
-                    "height": height,
-                    "dpi": dpi,
-                    "created_at": _now(),
+                candidates.append({
+                    "id": f"c{len(candidates) + 1}",
+                    "page_number": page_number,
+                    "page": page,
+                    "rect": item["rect"],
+                    "kind": item["kind"],
+                    "label": _clean_text(item.get("label"), 200),
+                    "caption": _clean_text(
+                        item.get("caption"), _MAX_CAPTION_CHARS
+                    ),
+                    "text": _clean_text(item.get("text"), _MAX_CAPTION_CHARS),
                 })
-            if capped:
+            if candidate_capped:
                 break
+
+        selection = {"selected": [], "warning": "", "capped": False}
+        if goal_filtered:
+            selection = select_figures_for_goal(
+                candidates, goal_text, title=title
+            )
+            selected_ids = [item["id"] for item in selection["selected"]]
+        else:
+            selected_ids = [candidate["id"] for candidate in candidates]
+        reasons = {
+            item["id"]: item.get("reason", "")
+            for item in selection.get("selected", [])
+        }
+        selected_set = set(selected_ids)
+        selected_candidates = [
+            candidate for candidate in candidates
+            if candidate["id"] in selected_set
+        ]
+
+        for candidate in selected_candidates:
+            if len(entries) >= max_figures:
+                capped = True
+                break
+            page = candidate["page"]
+            page_number = candidate["page_number"]
+            try:
+                png, width, height = _render_png(
+                    page, candidate["rect"], dpi
+                )
+            except Exception as exc:
+                scanning_warnings.append(
+                    f"Could not render page {page_number}: {exc}"
+                )
+                continue
+            if not png:
+                continue
+            figure_id = _figure_id(key, page_number, candidate["kind"], png)
+            if figure_id in seen:
+                duplicates += 1
+                continue
+            seen.add(figure_id)
+            relative = f"{stem}/fig_{figure_id}.png"
+            target = _safe_figure_path(relative, must_exist=False)
+            if target is None:
+                scanning_warnings.append(
+                    "Could not resolve the figure output path."
+                )
+                continue
+            if target.is_file():
+                duplicates += 1
+            else:
+                try:
+                    _write_png(target, png)
+                except OSError as exc:
+                    scanning_warnings.append(
+                        f"Could not save a figure PNG: {exc}"
+                    )
+                    continue
+            entries.append({
+                "id": figure_id,
+                "paper_key": key,
+                "title": _clean_text(title, 500),
+                "label": candidate["label"],
+                "caption": candidate["caption"],
+                "reason": reasons.get(candidate["id"], ""),
+                "page": page_number,
+                "file": relative,
+                "kind": candidate["kind"],
+                "width": width,
+                "height": height,
+                "dpi": dpi,
+                "created_at": _now(),
+            })
     finally:
         try:
             document.close()
         except Exception:
             pass
 
-    return _sort_entries(entries), {
-        "duplicates": duplicates,
-        "capped": capped,
-        "warning": warning,
-    }
+    warnings = scanning_warnings
+    if selection.get("warning"):
+        warnings.append(str(selection["warning"]))
+    matched = len(selected_ids)
+    return _sort_entries(entries), _detect_stats(
+        candidates=len(candidates),
+        matched=matched,
+        skipped=max(len(candidates) - matched, 0),
+        duplicates=duplicates,
+        capped=bool(capped or selection.get("capped")),
+        candidate_capped=candidate_capped,
+        goal_filtered=goal_filtered,
+        goal_empty=goal_empty,
+        warning=" ".join(warnings),
+    )
 
 
-def detect_figures(pdf_path, paper_key, title="", dpi=None):
+def detect_figures(pdf_path, paper_key, title="", dpi=None, goal=None,
+                   goal_filter=None):
     """Detect and render figures for one PDF.
 
     Returns the list of unique figure entries (including entries whose PNG was
-    already cached). Never raises: disabled detection, a missing PDF or an
-    unreadable document all yield ``[]``.
+    already cached). A non-empty ``goal`` selects only matching candidates;
+    ``goal=None`` keeps the legacy all-figures behaviour. Never raises:
+    disabled detection, a missing PDF or an unreadable document all yield
+    ``[]``.
     """
     try:
-        entries, _stats = _detect(pdf_path, paper_key, title=title, dpi=dpi)
+        entries, _stats = _detect(
+            pdf_path,
+            paper_key,
+            title=title,
+            dpi=dpi,
+            goal=goal,
+            goal_filter=goal_filter,
+        )
         return entries
     except Exception:
         return []
@@ -791,8 +1086,15 @@ def _summary(paper_key="", **values):
     summary = {
         "paper_key": str(paper_key or ""),
         "saved": 0,
+        "candidates": 0,
+        "selected": 0,
+        "matched": 0,
+        "skipped": 0,
         "duplicates": 0,
         "capped": False,
+        "candidate_capped": False,
+        "goal_filtered": False,
+        "goal_empty": False,
         "warning": "",
         "kinds": {},
     }
@@ -808,9 +1110,13 @@ def _kind_counts(entries):
     return counts
 
 
-def process_paper(pdf_path, paper_key, title="", pdf_file="", pdf_source=""):
-    """Detect figures, replace this paper's index entries and write the Excel.
+def process_paper(pdf_path, paper_key, title="", pdf_file="", pdf_source="",
+                  goal=None, goal_filter=None):
+    """Select goal-relevant figures, replace this paper's index and write Excel.
 
+    ``goal=None`` keeps the legacy all-figures behaviour. With goal filtering
+    enabled (the default), a non-empty goal is sent to the configured LLM and
+    only matching candidates are rendered; an empty goal saves no figures.
     Returns a summary dict; every failure is reported as a warning instead of
     being raised into the extraction job.
     """
@@ -819,6 +1125,7 @@ def process_paper(pdf_path, paper_key, title="", pdf_file="", pdf_source=""):
         key,
         pdf_file=str(pdf_file or ""),
         pdf_source=str(pdf_source or "none"),
+        goal_filtered=bool(_goal_filter(goal_filter) and goal is not None),
     )
     if not _enabled():
         summary["warning"] = "Figure detection is disabled (FIGURES_ENABLED = False)."
@@ -836,13 +1143,26 @@ def process_paper(pdf_path, paper_key, title="", pdf_file="", pdf_source=""):
         return summary
 
     try:
-        entries, stats = _detect(pdf_path, key, title=title)
+        entries, stats = _detect(
+            pdf_path,
+            key,
+            title=title,
+            goal=goal,
+            goal_filter=goal_filter,
+        )
     except Exception as exc:  # noqa: BLE001 - figures must never fail extraction
         summary["warning"] = f"Figure detection failed: {exc}"
         return summary
 
+    summary["candidates"] = int(stats.get("candidates") or 0)
+    summary["selected"] = int(stats.get("matched") or 0)
+    summary["matched"] = int(stats.get("matched") or 0)
+    summary["skipped"] = int(stats.get("skipped") or 0)
     summary["duplicates"] = int(stats.get("duplicates") or 0)
     summary["capped"] = bool(stats.get("capped"))
+    summary["candidate_capped"] = bool(stats.get("candidate_capped"))
+    summary["goal_filtered"] = bool(stats.get("goal_filtered"))
+    summary["goal_empty"] = bool(stats.get("goal_empty"))
     if stats.get("warning"):
         summary["warning"] = str(stats["warning"])
 
@@ -873,20 +1193,45 @@ def summary_message(summary):
     saved = int(summary.get("saved") or 0)
     duplicates = int(summary.get("duplicates") or 0)
     kinds = summary.get("kinds") or {}
+    candidates = int(summary.get("candidates") or 0)
+    matched = int(summary.get("matched") or 0)
+    filtered = bool(summary.get("goal_filtered"))
+    goal_empty = bool(summary.get("goal_empty"))
 
     if saved:
         detail = ", ".join(
             f"{count} {kind}" for kind, count in sorted(kinds.items()) if count
         )
-        text = f"{saved} figure screenshot(s) saved"
+        if filtered:
+            text = (
+                f"{saved} figure screenshot(s) matched the extraction goal "
+                f"(from {candidates} candidate(s))"
+            )
+        else:
+            text = f"{saved} figure screenshot(s) saved"
         if detail:
             text += f" ({detail})"
+    elif goal_empty and filtered:
+        text = (
+            "No figures saved: the extraction goal is empty, so no figures "
+            "were requested."
+        )
+    elif filtered and candidates and not matched:
+        text = (
+            f"No figures matched the extraction goal "
+            f"({candidates} candidate(s) skipped)."
+        )
     else:
-        text = "no figures detected"
+        text = "No figures detected."
     if duplicates:
-        text += f", {duplicates} duplicate(s) skipped"
+        text = text.rstrip(".") + f", {duplicates} duplicate(s) skipped"
     if summary.get("capped"):
-        text += f", capped at {_max_figures()}"
+        text = text.rstrip(".") + f", capped at {_max_figures()}"
+    if summary.get("candidate_capped"):
+        text = (
+            text.rstrip(".")
+            + f", candidate list capped at {_max_candidates()}"
+        )
     warning = str(summary.get("warning") or "").strip()
     if warning:
         return f"Figure warning: {text} — {warning}" if saved else f"Figure warning: {warning}"

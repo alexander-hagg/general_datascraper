@@ -159,6 +159,9 @@
       </div>
       <div id="goal-suggest-panel" class="suggest-panel goal-suggest-panel hidden"
            role="region" aria-live="polite" aria-label="Improved goal suggestions"></div>
+      <p class="hint figures-goal-hint">Figures and tables are selected from this goal.
+        To collect them, ask for figures, images or tables in the goal above
+        (e.g. “Find figures showing current traces for each mutation”).</p>
 
       <label class="field-label" for="columns">Column names for the spreadsheet <span class="muted">(comma-separated, optional)</span></label>
       <div class="history-row">
@@ -264,8 +267,9 @@
             <button class="ghost-btn mini" id="dl-figures-gallery"
                     onclick="downloadFile('figures.xlsx')">⬇ figures.xlsx</button>
           </div>
-          <p class="hint figures-hint">Screenshots detected in the archived PDFs.
-            Captions and page numbers come from the PDF; image-only papers are not OCR'd.</p>
+          <p class="hint figures-hint">Figures and tables selected for the extraction goal
+            from the archived PDFs. Captions and page numbers come from the PDF;
+            image-only papers are not OCR'd.</p>
           <div id="figures-gallery" class="figures-gallery"></div>
         </section>
       </div>
@@ -285,6 +289,7 @@
           <p id="figure-modal-title" class="figure-modal-title"></p>
           <p id="figure-modal-meta" class="figure-modal-meta"></p>
           <p id="figure-modal-caption" class="figure-modal-caption"></p>
+          <p id="figure-modal-reason" class="figure-modal-reason" hidden></p>
           <a id="figure-modal-link" class="figure-modal-link" href="#" target="_blank"
              rel="noopener">Open image in new tab ↗</a>
         </div>
