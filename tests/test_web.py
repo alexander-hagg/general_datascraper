@@ -1610,6 +1610,112 @@ class ExtractJobCancelTests(unittest.TestCase):
             self.assertNotIn("pmid:666", state)
 
 
+class SuggestGoalApiTests(unittest.TestCase):
+    def setUp(self):
+        self.client = web.app.test_client()
+
+    def _post(self, payload):
+        return self.client.post("/api/suggest-goal", json=payload)
+
+    def test_success_returns_metadata_without_starting_a_job_or_history(self):
+        jobs_before = set(web.JOBS)
+        with mock.patch.object(
+            web.suggester, "suggest_goal", return_value=["Goal A", "Goal B"]
+        ) as suggest, \
+             mock.patch.object(
+                 web.suggester,
+                 "llm_source",
+                 return_value={"source": "llm", "model": "test-model"},
+             ), \
+             mock.patch.object(web, "_start_job") as start_job, \
+             mock.patch.object(web.history, "record") as record:
+            response = self._post({
+                "goal": "  Extract mutations ",
+                "columns": ["mutation", "effect"],
+                "mode": "table",
+            })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {
+            "source": "llm",
+            "model": "test-model",
+            "suggestions": ["Goal A", "Goal B"],
+        })
+        suggest.assert_called_once_with(
+            "Extract mutations",
+            columns=["mutation", "effect"],
+            mode="table",
+        )
+        start_job.assert_not_called()
+        record.assert_not_called()
+        self.assertEqual(set(web.JOBS), jobs_before)
+
+    def test_empty_goal_gets_400_without_calling_the_llm(self):
+        for payload in ({"goal": ""}, {"goal": "   "}, {}):
+            with self.subTest(payload=payload):
+                with mock.patch.object(web.suggester, "suggest_goal") as suggest:
+                    response = self._post(payload)
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("Describe what data you want", response.get_json()["error"])
+                suggest.assert_not_called()
+
+    def test_backend_unavailable_gets_503(self):
+        with mock.patch.object(
+            web.suggester,
+            "suggest_goal",
+            side_effect=web.suggester.BackendUnavailable("Ollama is not running."),
+        ):
+            response = self._post({"goal": "Extract mutations"})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["error"], "Ollama is not running.")
+
+    def test_value_error_gets_400(self):
+        with mock.patch.object(
+            web.suggester,
+            "suggest_goal",
+            side_effect=ValueError("Unknown extraction mode 'figures'."),
+        ):
+            response = self._post({"goal": "Extract mutations", "mode": "figures"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Unknown extraction mode", response.get_json()["error"])
+
+    def test_unexpected_failure_gets_502(self):
+        with mock.patch.object(
+            web.suggester,
+            "suggest_goal",
+            side_effect=RuntimeError("parse exploded"),
+        ):
+            response = self._post({"goal": "Extract mutations"})
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.get_json()["error"],
+            "Could not improve the goal: parse exploded",
+        )
+
+
+class SuggestGoalMarkupTests(unittest.TestCase):
+    def test_button_panel_and_script_are_wired_after_the_goal(self):
+        root = Path(__file__).resolve().parent.parent
+        template = (root / "templates" / "index.html").read_text(encoding="utf-8")
+        script = (root / "static" / "app.js").read_text(encoding="utf-8")
+
+        goal_at = template.index('id="goal"')
+        button_at = template.index('id="improve-goal"')
+        panel_at = template.index('id="goal-suggest-panel"')
+        columns_at = template.index('for="columns"')
+        self.assertLess(goal_at, button_at)
+        self.assertLess(button_at, panel_at)
+        self.assertLess(panel_at, columns_at)
+        self.assertIn("✨ Improve goal", template)
+        self.assertIn(
+            'aria-label="Improve the extraction goal with the LLM"', template
+        )
+        self.assertIn("/api/suggest-goal", script)
+        self.assertIn("Use this goal", script)
+        self.assertIn("improveGoal", script)
+        self.assertIn("applyGoalSuggestion", script)
+
+
 class DataTabViewerMarkupTests(unittest.TestCase):
     def test_viewer_markup_and_api_plumbing_exist(self):
         root = Path(__file__).resolve().parent.parent

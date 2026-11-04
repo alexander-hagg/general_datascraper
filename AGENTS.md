@@ -186,9 +186,33 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   `GET /api/figure/<figure_id>` serves only ids in the figure index, resolving
   their relative paths under `FIGURES_DIR`; unknown/unsafe/missing ids are 404.
   `/download` exposes only the four Excel files (including `figures.xlsx`).
+- `suggester.py`: PubMed autocomplete plus the LLM helpers behind the web UI.
+  `autocomplete()` never raises. `suggest_related()`,
+  `suggest_related_many()` and `suggest_goal(goal, columns=None,
+  mode="records")` call `_require_backend()` first (`extractor.backend_status()`
+  checks Ollama `/api/tags` or the OpenAI config), then `_call_llm(prompt,
+  schema)` with `LLM_TIMEOUT = 120` seconds, JSON mode and schema-constrained
+  output; `_load_json_object()` tolerates fenced/prose JSON. `BackendUnavailable`
+  propagates so the route can answer 503; bad input raises `ValueError`.
+  `suggest_goal()` whitespace-normalizes the goal, caps it at 4000 characters,
+  accepts a column list or comma-separated string (cleaned/deduped/capped at 50)
+  and normalizes `mode` to `records`/`table`. It returns at most three cleaned,
+  deduped goal strings (1200 characters each), never starts a job or records
+  prompt history, and never writes the goal itself.
 - `static/app.js` + `templates/index.html`: vanilla JS query builder, no bundler.
   `/api/autocomplete` proxies PubMed suggestions to avoid browser CORS;
-  `/api/suggest` uses the LLM through `suggester.py`. The Data & PDFs tab keeps
+  `/api/suggest` uses the LLM through `suggester.py`; `POST /api/suggest-goal`
+  takes `{goal, columns, mode}`, returns `{source, model, suggestions}` and maps
+  empty/invalid input to 400, `BackendUnavailable` to 503 and unexpected
+  LLM/parse failures to 502 ("Could not improve the goal: …"). The route must
+  never call `_start_job` or `history.record`.
+  `#improve-goal` sits directly below `#goal` (the Previous goals row stays
+  above the textarea); `improveGoal()` posts the current goal/columns/mode and
+  renders 1-3 candidates in `#goal-suggest-panel` with the existing
+  `.suggest-panel` styles and an `LLM · model` badge. Each candidate has
+  **Use this goal**, which writes the exact text into `#goal`, focuses it and
+  shows a banner; Cancel/Dismiss closes the panel. There is no auto-run and no
+  history entry — only starting Extract records the goal. The Data & PDFs tab keeps
   the grouped extracted table on the left and a sticky ~46% quote/PDF pane on
   the right (`iframe#pdf-viewer`, annotations metadata by `row_index`, page
   anchor, "Open in new tab"); mobile stacks the pane below the table. The quote
@@ -288,6 +312,13 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   HTML/PMC figure download. Index paths are POSIX relative names validated
   under `FIGURES_DIR`; never accept a caller-supplied path. Orphan PNGs from
   older versions may remain, but only index entries are served.
+- **Improve goal is advisory and side-effect free:** the button only rewrites
+  goal text. It must never start/queue an extraction, write `web_settings.json`,
+  save a run state, or record prompt history; those happen when the user clicks
+  **Extract data**. Applying a candidate is explicit (**Use this goal**) and only
+  updates `#goal`; Cancel/Dismiss leaves it unchanged. Keep the button/panel
+  directly after `#goal` and before the column-name field, and keep the Previous
+  goals history row above the textarea.
 - **Web folder-only search:** `/api/search` allows an empty query and no sources
   only when a valid `local_folder` is supplied. Supplying a query without sources
   (or sources without a query) is still a 400. Omitted `local_folder` /
@@ -298,7 +329,8 @@ No build step, package metadata, linter, or CI; unit tests live in `tests/`.
   search payload (including the browser's `query_tree` plus sources, max results,
   years, journal terms and local-folder fields) after validation and before any
   scan/search; Extract records the goal and, when non-empty, the joined columns
-  before processing. Any `history.record` failure is logged as a warning and
+  before processing. `/api/suggest-goal` never records history or saves the goal;
+  only starting Extract does. Any `history.record` failure is logged as a warning and
   must not fail the job. `GET /api/history[?kind=search|goal|columns]` lists
   entries newest-used first; `POST /api/history/clear` with an optional `kind`
   clears one kind or all. Never expose the history file through a serving route.

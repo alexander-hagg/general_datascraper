@@ -1062,6 +1062,40 @@ def api_suggest():
         return jsonify({"error": f"Could not generate suggestions: {e}"}), 502
 
 
+@app.route("/api/suggest-goal", methods=["POST"])
+def api_suggest_goal():
+    """LLM-backed rewrite of the extraction goal.
+
+    Request body:
+      {"goal": "...", "columns": ["mutation"], "mode": "records"}
+    Success:
+      {"source": "llm", "model": "...", "suggestions": ["...", ...]}
+
+    This endpoint only reads the current goal/columns/mode. It never starts an
+    extraction job and never records prompt history; those happen only when the
+    user confirms a goal and clicks Extract data.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    raw_goal = data.get("goal")
+    goal = raw_goal.strip() if isinstance(raw_goal, str) else ""
+    if not goal:
+        return jsonify({"error": "Describe what data you want to extract first."}), 400
+
+    try:
+        suggestions = suggester.suggest_goal(
+            goal,
+            columns=data.get("columns"),
+            mode=data.get("mode") or "records",
+        )
+        return jsonify({**suggester.llm_source(), "suggestions": suggestions})
+    except suggester.BackendUnavailable as e:
+        return jsonify({"error": str(e)}), 503
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:  # unexpected LLM/parse failure: report, don't crash
+        return jsonify({"error": f"Could not improve the goal: {e}"}), 502
+
+
 @app.route("/api/settings", methods=["GET", "POST"])
 def api_settings():
     if request.method == "POST":

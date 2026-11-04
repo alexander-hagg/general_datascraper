@@ -185,6 +185,23 @@ textarea { resize: vertical; }
 .suggest-group:first-child { border-top: none; }
 .suggest-group-term { font-weight: 600; font-size: 0.88rem; }
 .suggest-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+
+/* Improve-goal button + candidate panel (Extract card) */
+.goal-suggest-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 2px 0 10px;
+}
+.goal-suggest-hint { margin: 0; }
+.goal-suggest-panel { margin: 4px 0 12px; }
+.goal-suggest-head { display: flex; align-items: center; gap: 8px; }
+.goal-suggest-head .suggest-badge { margin-left: auto; }
+.goal-suggestion { padding: 8px 0; }
+.goal-suggestion + .goal-suggestion { border-top: 1px dashed var(--line); }
+.goal-suggestion-text {
+  font-size: 0.88rem; line-height: 1.45;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.goal-suggestion .ghost-btn { margin-top: 6px; }
 select {
   padding: 10px 8px; border: 1px solid var(--line); border-radius: 8px;
   font: inherit; font-size: 0.9rem; background: #fff; color: var(--ink);

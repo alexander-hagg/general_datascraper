@@ -1445,6 +1445,98 @@ async function suggestAllTerms() {
   }
 }
 
+/* ---------- LLM "Improve goal" (extraction instruction) ---------- */
+
+function closeGoalSuggestPanel() {
+  const panel = document.getElementById("goal-suggest-panel");
+  if (!panel) return;
+  panel.classList.add("hidden");
+  panel.innerHTML = "";
+}
+
+function appendGoalPanelClose(panel, label) {
+  const actions = makeEl("div", "suggest-actions");
+  const close = makeEl("button", "ghost-btn mini", label || "Cancel");
+  close.type = "button";
+  close.onclick = closeGoalSuggestPanel;
+  actions.appendChild(close);
+  panel.appendChild(actions);
+}
+
+function applyGoalSuggestion(text) {
+  document.getElementById("goal").value = text;
+  closeGoalSuggestPanel();
+  document.getElementById("goal").focus();
+  setBanner("Goal updated. Review it, then click Extract data when you are ready.", "ok");
+}
+
+async function improveGoal() {
+  const goalEl = document.getElementById("goal");
+  const panel = document.getElementById("goal-suggest-panel");
+  const button = document.getElementById("improve-goal");
+  const goal = goalEl.value.trim();
+
+  panel.classList.remove("hidden");
+  panel.innerHTML = "";
+  if (!goal) {
+    showPanelError(panel, "Describe what data you want to extract first, then ask for an improved goal.");
+    goalEl.focus();
+    return;
+  }
+
+  const parsed = parseColumnInput(document.getElementById("columns").value);
+  const mode = document.getElementById("extraction-mode").value || "records";
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = "✨ Improving…";
+  panel.appendChild(makeEl("div", "suggest-loading", "Asking the LLM for clearer goal wording…"));
+
+  try {
+    const data = await postJSON("/api/suggest-goal", {
+      goal,
+      columns: parsed.columns,
+      mode,
+    });
+    panel.innerHTML = "";
+    const suggestions = (data.suggestions || [])
+      .filter(s => typeof s === "string" && s.trim());
+    if (!suggestions.length) {
+      panel.appendChild(makeEl(
+        "div",
+        "suggest-empty",
+        "The LLM did not return a usable goal. Try rewording your goal or listing the columns you need."
+      ));
+      appendGoalPanelClose(panel, "Dismiss");
+      return;
+    }
+
+    const head = makeEl("div", "suggest-head goal-suggest-head");
+    head.appendChild(makeEl("span", "", "Improved goal candidates"));
+    const badge = makeSourceBadge(data.source || "llm", data.model || "");
+    if (badge) head.appendChild(badge);
+    panel.appendChild(head);
+
+    suggestions.forEach(s => {
+      const block = makeEl("div", "goal-suggestion");
+      block.appendChild(makeEl("div", "goal-suggestion-text", s));
+      const use = makeEl("button", "ghost-btn mini", "Use this goal");
+      use.type = "button";
+      use.setAttribute("aria-label", "Use this improved goal");
+      use.onclick = () => applyGoalSuggestion(s);
+      block.appendChild(use);
+      panel.appendChild(block);
+    });
+    appendGoalPanelClose(panel, "Cancel");
+  } catch (e) {
+    panel.innerHTML = "";
+    showPanelError(panel, e.message || "Could not improve the goal.");
+    appendGoalPanelClose(panel, "Dismiss");
+  } finally {
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }
+}
+
 function renderTermRow(node, index) {
   const row = document.createElement("div");
   row.className = "term-row";

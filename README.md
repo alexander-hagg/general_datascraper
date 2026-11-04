@@ -498,6 +498,30 @@ send the affected search term(s) to the LLM backend configured in `config.py`
 an OpenAI-compatible endpoint sends them to that provider. Nothing else is sent,
 and neither feature changes the search or extraction pipeline.
 
+## Improving the extraction goal
+
+The Extract card has a **✨ Improve goal** button directly below the goal box
+("What data do you want from the papers?"). It sends the current goal, the
+column names you listed and the selected extraction mode to the configured LLM
+and asks for one to three clearer phrasings. The suggestions aim to make the
+goal self-contained and extraction-friendly: what counts as one record or table
+row, which conditions/units/quantified values matter, and whether negative or
+null findings should be reported. The model is told to preserve your scientific
+intent and not invent facts or requirements.
+
+The candidates appear in a panel with an **LLM** provenance badge (including
+the model name). Click **Use this goal** to copy exactly that text into the goal
+box; the panel closes and the box is focused so you can review or edit it. A
+short confirmation appears at the top of the page. Nothing runs automatically:
+click **Extract data** yourself when the goal, columns and mode look right.
+**Cancel** (or **Dismiss** after an error) closes the panel without changing the
+box.
+
+Improving a goal does not add an entry to **Previous goals**; that history is
+written only when an extraction starts. The feature requires the same
+Ollama/OpenAI-compatible backend as extraction. If it is not running or not
+configured, the panel shows a clear error and your goal text stays untouched.
+
 ## Prompt history
 
 The web app remembers what you typed, so you do not have to rebuild a search

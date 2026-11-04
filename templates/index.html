@@ -150,6 +150,15 @@
                 aria-label="Clear previous goals" title="Clear previous goals" disabled>Clear</button>
       </div>
       <textarea id="goal" rows="3" placeholder="e.g. Every mutation that was tested, and whether it increased or decreased channel function"></textarea>
+      <div class="goal-suggest-row">
+        <button class="ghost-btn" id="improve-goal" type="button"
+                aria-label="Improve the extraction goal with the LLM"
+                title="Ask the configured LLM for clearer goal wording"
+                onclick="improveGoal()">✨ Improve goal</button>
+        <span class="hint goal-suggest-hint">Rewrites the wording only; nothing runs until you click <strong>Extract data</strong>.</span>
+      </div>
+      <div id="goal-suggest-panel" class="suggest-panel goal-suggest-panel hidden"
+           role="region" aria-live="polite" aria-label="Improved goal suggestions"></div>
 
       <label class="field-label" for="columns">Column names for the spreadsheet <span class="muted">(comma-separated, optional)</span></label>
       <div class="history-row">
